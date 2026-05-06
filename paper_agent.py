@@ -389,7 +389,7 @@ Respond ONLY in JSON:
   "impact_reason": "FVG fill + BOS confirm + FII buying — strong institutional BUY setup",
   "risk_factors": "RBI surprise ya global selloff",
   "other_stocks_impacted": ["ICICIBANK.NS", "SBIN.NS"]
-}}
+}}"""
 
     try:
         resp = await claude.messages.create(

@@ -318,8 +318,8 @@ async def ai_analyze_news(articles: list[dict], stock_news: dict, price_data: di
 
 ━━━━━━━━ STEP 1: GLOBAL MARKET CHECK ━━━━━━━━
 News mein dekh: US markets (Dow, S&P, Nasdaq), SGX Nifty, Asian markets kaisa hai?
-- Agar global markets UP → India bullish → sirf BUY trades
-- Agar global markets DOWN → India bearish → sirf SELL trades
+- Global markets UP → India bullish → sirf BUY trades
+- Global markets DOWN → India bearish → sirf SELL trades
 - Mixed → strong individual stock news dekh
 
 ━━━━━━━━ SAARI MARKET NEWS ━━━━━━━━
@@ -331,25 +331,39 @@ News mein dekh: US markets (Dow, S&P, Nasdaq), SGX Nifty, Asian markets kaisa ha
 ━━━━━━━━ TOP MOVERS (Price + Volume) ━━━━━━━━
 {movers_text if movers_text else "Price data unavailable"}
 
+━━━━━━━━ SMC ANALYSIS FRAMEWORK ━━━━━━━━
+Har stock ke liye mentally yeh check karo:
+
+📦 FAIR VALUE GAP (FVG):
+- 3 candle pattern — middle candle badi move karti hai, gap rehta hai
+- Price FVG fill karne aata hai → entry opportunity
+- Bullish FVG: price neeche aake FVG fill kare → BUY
+- Bearish FVG: price upar aake FVG fill kare → SELL
+- News + FVG = strong confluence
+
+🏗️ BREAK OF STRUCTURE (BOS):
+- Higher High + Higher Low = Bullish BOS → BUY trend confirm
+- Lower Low + Lower High = Bearish BOS → SELL trend confirm
+- BOS ke baad retest pe entry lo
+- Strong volume ke saath BOS = institutional confirmation
+
 ━━━━━━━━ TERI TASK ━━━━━━━━
-1. Global market mood check karo (bullish/bearish/neutral)
-2. TOP 10 liquid sectors mein se best stock dhundo:
-   IT | Pharma | Defence | Banking | Healthcare | Cement | FMCG | Capital Goods | Energy | Auto
-3. Stock selection criteria:
-   ✅ Large cap, high liquidity (prefer: Reliance, TCS, HDFC, Infosys, SBI, Tata Motors etc.)
-   ✅ Volume spike ho raha hai (vol_ratio > 1.2x)
-   ✅ Strong news catalyst hai
-   ✅ Breakout ya support/resistance pe hai
-4. Market bullish → SIRF BUY | Market bearish → SIRF SELL
-5. Smart Money concept: institutional buying/selling ke saath chalo
-6. HAMESHA ek trade do — chahe news kam ho, price action se decide karo
-7. Candle pattern mentally check karo — breakout, support bounce, resistance break
-8. SL: 1.5-2% | Target: 2.5-3.5% | Min R:R 1:1.5
+1. Global market mood check karo
+2. TOP liquid sectors: IT | Pharma | Defence | Banking | FMCG | Energy | Auto | Cement
+3. Stock selection:
+   ✅ Large cap, high liquidity
+   ✅ Volume spike (vol_ratio > 1.2x) = institutional activity
+   ✅ News catalyst + SMC setup = strong trade
+   ✅ FVG ya BOS confluence ho toh extra confidence
+4. Market bullish → SIRF BUY | Bearish → SIRF SELL
+5. HAMESHA ek trade do — news na ho toh price action + SMC se decide karo
+6. SL: FVG ke neeche ya BOS level | Target: next FVG ya structure level
+7. Min R:R 1:1.5
 
-News type classify karo:
-ORDER_WIN | QUARTERLY_RESULT | MERGER_ACQUISITION | COMMODITY_IMPACT | POLICY_CHANGE | FII_DII | MANAGEMENT_CHANGE | GLOBAL_IMPACT | TECHNICAL_BREAKOUT | SECTOR_ROTATION
+News type:
+ORDER_WIN | QUARTERLY_RESULT | MERGER_ACQUISITION | COMMODITY_IMPACT | POLICY_CHANGE | FII_DII | MANAGEMENT_CHANGE | GLOBAL_IMPACT | TECHNICAL_BREAKOUT | SECTOR_ROTATION | SMC_SETUP
 
-Respond ONLY in JSON — koi extra text nahi:
+Respond ONLY in JSON:
 {{
   "found_signal": true,
   "global_market": "BULLISH",
@@ -359,36 +373,23 @@ Respond ONLY in JSON — koi extra text nahi:
   "sector": "Banking",
   "direction": "BUY",
   "news_type": "FII_DII",
-  "news_type_hindi": "FII ne banking sector mein buying ki",
+  "news_type_hindi": "FII ne banking mein buying ki",
   "entry": 1750.00,
   "stop_loss": 1724.00,
   "target": 1811.00,
   "risk_reward": "1:2.3",
-  "confidence_pct": 72,
-  "confidence": "HIGH",
-  "key_news": [
-    "FII ne ₹3200 Cr ki net buying ki",
-    "Banking sector mein momentum strong",
-    "HDFC Bank volume 2x normal se zyada"
-  ],
-  "impact_reason": "FII buying + volume spike + global markets green — strong BUY setup",
-  "risk_factors": "RBI policy surprise ya global selloff",
-  "other_stocks_impacted": ["ICICIBANK.NS", "SBIN.NS"]
-}}
-  "risk_reward": "1:2",
   "confidence_pct": 78,
   "confidence": "HIGH",
+  "smc_setup": "Bullish FVG at 1748-1752 + BOS confirmed above 1760",
   "key_news": [
-    "Global steel prices 3% barhe — China production cut",
-    "Tata Steel Q3 production record high",
-    "Iron ore prices stable — margin improvement expected"
+    "FII ne ₹3200 Cr ki net buying ki",
+    "HDFC Bank volume 2x normal",
+    "Banking sector mein momentum"
   ],
-  "impact_reason": "Exactly kyon yeh stock move karega — 2-3 lines",
-  "risk_factors": "Kya risk hai",
-  "other_stocks_impacted": ["JSWSTEEL.NS", "SAIL.NS"]
+  "impact_reason": "FVG fill + BOS confirm + FII buying — strong institutional BUY setup",
+  "risk_factors": "RBI surprise ya global selloff",
+  "other_stocks_impacted": ["ICICIBANK.NS", "SBIN.NS"]
 }}
-
-Agar strong signal nahi: {{"found_signal": false, "reason": "kyon nahi mila"}}"""
 
     try:
         resp = await claude.messages.create(
@@ -452,7 +453,8 @@ def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
         f"{d_emo} *{signal['name']}* | {signal.get('sector','')}\n"
         f"{conf_emo} Confidence: {signal.get('confidence','MEDIUM')} ({signal.get('confidence_pct',65)}%)\n\n"
         f"📰 *{signal.get('news_type_hindi', signal.get('news_type',''))}*\n\n"
-        f"📌 *Key News:*\n{key_news}\n\n"
+        + (f"🏗️ *SMC Setup:* `{signal.get('smc_setup','')}`\n\n" if signal.get('smc_setup') else "")
+        + f"📌 *Key News:*\n{key_news}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💡 *Impact:*\n_{signal.get('impact_reason','')}_\n\n"
         f"⚠️ *Risk:* _{signal.get('risk_factors','N/A')}_\n"

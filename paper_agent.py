@@ -22,6 +22,9 @@ from anthropic import AsyncAnthropic
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
+# Global market state — bullish/bearish
+market_bias = {"direction": "NEUTRAL", "reason": "", "updated": None}
+
 # ══════════════════════════════════════════════════════════════════════
 # ⚙️  CONFIG
 # ══════════════════════════════════════════════════════════════════════
@@ -302,42 +305,76 @@ async def ai_analyze_news(articles: list[dict], stock_news: dict, price_data: di
         price_info = f"₹{price_data[sym]['price']} ({price_data[sym]['change_pct']:+.2f}%)" if sym in price_data else "NA"
         stock_news_text += f"\n• {name} ({sym}) [{price_info}]: {headlines}"
 
-    price_text = "\n".join([
-        f"• {STOCKS.get(sym,{}).get('name',sym)}: ₹{d['price']} ({d['change_pct']:+.2f}%, Vol {d['volume_ratio']}x)"
-        for sym, d in price_data.items() if sym in STOCKS
-    ][:30])
+    # Top movers from price data
+    movers_text = ""
+    if price_data:
+        sorted_by_move = sorted(price_data.items(), key=lambda x: abs(x[1]['change_pct']), reverse=True)
+        movers_text = "\n".join([
+            f"• {STOCKS.get(sym,{}).get('name',sym)}: ₹{d['price']} ({d['change_pct']:+.2f}%, Vol {d['volume_ratio']}x)"
+            for sym, d in sorted_by_move[:15] if sym in STOCKS
+        ])
 
-    prompt = f"""Tu ek expert NSE stock analyst hai. Neeche India ki latest financial news hai — ORDERS, RESULTS, M&A, COMMODITIES, POLICY sab kuch.
+    prompt = f"""Tu ek expert NSE intraday trader hai jo Smart Money Concept (SMC) follow karta hai.
+
+━━━━━━━━ STEP 1: GLOBAL MARKET CHECK ━━━━━━━━
+News mein dekh: US markets (Dow, S&P, Nasdaq), SGX Nifty, Asian markets kaisa hai?
+- Agar global markets UP → India bullish → sirf BUY trades
+- Agar global markets DOWN → India bearish → sirf SELL trades
+- Mixed → strong individual stock news dekh
 
 ━━━━━━━━ SAARI MARKET NEWS ━━━━━━━━
 {all_news_text}
 
 ━━━━━━━━ STOCKS IN NEWS ━━━━━━━━
-{stock_news_text if stock_news_text else "Direct matches nahi — general market news dekh"}
+{stock_news_text if stock_news_text else "General market news se analyze karo"}
 
-━━━━━━━━ LIVE NSE PRICES ━━━━━━━━
-{price_text if price_text else "Price data unavailable"}
+━━━━━━━━ TOP MOVERS (Price + Volume) ━━━━━━━━
+{movers_text if movers_text else "Price data unavailable"}
 
-TERI TASK:
-1. Saari news padh — kaunse stock pe SABSE ZYADA impact hai aaj?
-2. News type classify kar:
-   ORDER_WIN | QUARTERLY_RESULT | MERGER_ACQUISITION | COMMODITY_IMPACT | POLICY_CHANGE | FII_DII | MANAGEMENT_CHANGE | GLOBAL_IMPACT | TECHNICAL_BREAKOUT
-3. Sirf recommend kar agar 70%+ confident ho
-4. SL tight rakho (1.5-2%), Target realistic (3-4%)
-5. Paper capital ₹10,000 — position ₹4,000 tak
+━━━━━━━━ TERI TASK ━━━━━━━━
+1. Global market mood check karo (bullish/bearish/neutral)
+2. TOP 10 liquid sectors mein se best stock dhundo:
+   IT | Pharma | Defence | Banking | Healthcare | Cement | FMCG | Capital Goods | Energy | Auto
+3. Stock selection criteria:
+   ✅ Large cap, high liquidity (prefer: Reliance, TCS, HDFC, Infosys, SBI, Tata Motors etc.)
+   ✅ Volume spike ho raha hai (vol_ratio > 1.2x)
+   ✅ Strong news catalyst hai
+   ✅ Breakout ya support/resistance pe hai
+4. Market bullish → SIRF BUY | Market bearish → SIRF SELL
+5. Smart Money concept: institutional buying/selling ke saath chalo
+6. HAMESHA ek trade do — chahe news kam ho, price action se decide karo
+7. Candle pattern mentally check karo — breakout, support bounce, resistance break
+8. SL: 1.5-2% | Target: 2.5-3.5% | Min R:R 1:1.5
+
+News type classify karo:
+ORDER_WIN | QUARTERLY_RESULT | MERGER_ACQUISITION | COMMODITY_IMPACT | POLICY_CHANGE | FII_DII | MANAGEMENT_CHANGE | GLOBAL_IMPACT | TECHNICAL_BREAKOUT | SECTOR_ROTATION
 
 Respond ONLY in JSON — koi extra text nahi:
 {{
   "found_signal": true,
-  "symbol": "TATASTEEL.NS",
-  "name": "Tata Steel",
-  "sector": "Metal",
+  "global_market": "BULLISH",
+  "global_reason": "SGX Nifty +0.5%, US markets green",
+  "symbol": "HDFCBANK.NS",
+  "name": "HDFC Bank",
+  "sector": "Banking",
   "direction": "BUY",
-  "news_type": "COMMODITY_IMPACT",
-  "news_type_hindi": "Global steel prices barh rahe hain",
-  "entry": 145.50,
-  "stop_loss": 141.80,
-  "target": 153.00,
+  "news_type": "FII_DII",
+  "news_type_hindi": "FII ne banking sector mein buying ki",
+  "entry": 1750.00,
+  "stop_loss": 1724.00,
+  "target": 1811.00,
+  "risk_reward": "1:2.3",
+  "confidence_pct": 72,
+  "confidence": "HIGH",
+  "key_news": [
+    "FII ne ₹3200 Cr ki net buying ki",
+    "Banking sector mein momentum strong",
+    "HDFC Bank volume 2x normal se zyada"
+  ],
+  "impact_reason": "FII buying + volume spike + global markets green — strong BUY setup",
+  "risk_factors": "RBI policy surprise ya global selloff",
+  "other_stocks_impacted": ["ICICIBANK.NS", "SBIN.NS"]
+}}
   "risk_reward": "1:2",
   "confidence_pct": 78,
   "confidence": "HIGH",
@@ -361,6 +398,11 @@ Agar strong signal nahi: {{"found_signal": false, "reason": "kyon nahi mila"}}""
         )
         raw  = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
         data = json.loads(raw)
+        # Update global market bias
+        if data.get("global_market"):
+            market_bias["direction"] = data["global_market"]
+            market_bias["reason"]    = data.get("global_reason","")
+            market_bias["updated"]   = datetime.datetime.now().strftime("%I:%M %p")
         return data if data.get("found_signal") else data
     except Exception as e:
         logger.error(f"AI error: {e}")
@@ -380,6 +422,7 @@ NEWS_LABELS = {
     "MANAGEMENT_CHANGE":  "👔 Management Change!",
     "GLOBAL_IMPACT":      "🌍 Global Market Impact!",
     "TECHNICAL_BREAKOUT": "📈 Technical Breakout!",
+    "SECTOR_ROTATION":    "🔄 Sector Rotation!",
 }
 
 def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
@@ -387,22 +430,28 @@ def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
     price    = signal["entry"]
     d_emo    = "📈" if signal["direction"] == "BUY" else "📉"
     conf_emo = "🔥" if signal["confidence"] == "HIGH" else "⚡"
-    label    = NEWS_LABELS.get(signal["news_type"], "📰 Market Alert!")
+    label    = NEWS_LABELS.get(signal.get("news_type",""), "📰 Market Alert!")
     qty      = max(1, int(portfolio["available"] * 0.4 / price))
     cost     = round(qty * price, 2)
     sl_pct   = round(abs(price - signal["stop_loss"]) / price * 100, 2)
     tgt_pct  = round(abs(signal["target"] - price) / price * 100, 2)
     others   = [STOCKS[s]["name"] for s in signal.get("other_stocks_impacted",[]) if s in STOCKS][:3]
-
     key_news = "\n".join([f"  • {n}" for n in signal.get("key_news", [])[:4]])
+
+    # Global market mood
+    g_mood = signal.get("global_market", market_bias["direction"])
+    g_emo  = {"BULLISH":"🟢 Bullish","BEARISH":"🔴 Bearish","NEUTRAL":"🟡 Neutral"}.get(g_mood,"🟡 Neutral")
+    g_reason = signal.get("global_reason", market_bias.get("reason",""))
 
     # Message 1: Main alert
     msg1 = (
         f"🚨 *{label}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🌍 *Global Market:* {g_emo}\n"
+        f"_{g_reason}_\n\n"
         f"{d_emo} *{signal['name']}* | {signal.get('sector','')}\n"
-        f"{conf_emo} Confidence: {signal['confidence']} ({signal['confidence_pct']}%)\n\n"
-        f"📰 *{signal.get('news_type_hindi', signal['news_type'])}*\n\n"
+        f"{conf_emo} Confidence: {signal.get('confidence','MEDIUM')} ({signal.get('confidence_pct',65)}%)\n\n"
+        f"📰 *{signal.get('news_type_hindi', signal.get('news_type',''))}*\n\n"
         f"📌 *Key News:*\n{key_news}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💡 *Impact:*\n_{signal.get('impact_reason','')}_\n\n"
@@ -413,10 +462,10 @@ def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
         f"📍 Entry:   ₹{signal['entry']:,.2f}\n"
         f"🛑 SL:      ₹{signal['stop_loss']:,.2f} (-{sl_pct}%)\n"
         f"🎯 Target:  ₹{signal['target']:,.2f} (+{tgt_pct}%)\n"
-        f"⚖️ R:R:     {signal['risk_reward']}\n\n"
+        f"⚖️ R:R:     {signal.get('risk_reward','1:2')}\n\n"
         f"📦 {qty} shares × ₹{price} = ₹{cost:,.0f}\n"
         f"💼 Balance: ₹{portfolio['available']:,.0f}\n"
-        f"🔢 Aaj ke trades: {portfolio['trades_today']}/{MAX_TRADES_PER_DAY} liye\n\n"
+        f"🔢 Aaj ke trades: {portfolio['trades_today']}/{MAX_TRADES_PER_DAY}\n\n"
         f"🤔 *YES* lena hai | *NO* skip karo"
     )
     messages.append(msg1)

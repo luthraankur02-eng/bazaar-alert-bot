@@ -207,18 +207,18 @@ async def send_to_all(text: str, parse_mode: str = "Markdown"):
 
 async def fetch_all_news() -> list[dict]:
     all_articles = []
-    async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+    # seen_headlines har scan pe reset karo — fresh news hamesha aaye
+    portfolio["seen_headlines"] = set()
+
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         for feed in NEWS_FEEDS:
             try:
                 resp   = await client.get(feed["url"])
                 parsed = feedparser.parse(resp.text)
-                for entry in parsed.entries[:8]:
+                for entry in parsed.entries[:10]:  # 8 se 10 kiya
                     headline = entry.get("title", "").strip()
-                    if not headline or headline in portfolio["seen_headlines"]:
+                    if not headline:
                         continue
-                    portfolio["seen_headlines"].add(headline)
-                    if len(portfolio["seen_headlines"]) > 2000:
-                        portfolio["seen_headlines"] = set(list(portfolio["seen_headlines"])[-1000:])
                     all_articles.append({
                         "source":   feed["name"],
                         "type":     feed["type"],
@@ -555,12 +555,57 @@ async def run_scan(silent: bool = False):
             await send_to_all(msg)
             await asyncio.sleep(1)
     else:
-        reason = result.get("reason","Koi strong opportunity nahi mili") if result else "Koi strong opportunity nahi mili"
+        # Fallback — price data se best mover dhundo aur signal do
+        if price_data:
+            # Sabse zyada volume wala liquid stock lo
+            best = max(
+                [(s,d) for s,d in price_data.items() if s in STOCKS],
+                key=lambda x: x[1]["volume_ratio"],
+                default=None
+            )
+            if best:
+                sym, d = best
+                direction = "BUY" if d["change_pct"] >= 0 else "SELL"
+                entry  = d["price"]
+                sl     = round(entry * 0.982, 2) if direction == "BUY" else round(entry * 1.018, 2)
+                target = round(entry * 1.03, 2)  if direction == "BUY" else round(entry * 0.97, 2)
+                fallback_signal = {
+                    "found_signal":   True,
+                    "global_market":  "NEUTRAL",
+                    "global_reason":  "Price action based signal",
+                    "symbol":         sym,
+                    "name":           STOCKS[sym]["name"],
+                    "sector":         STOCKS[sym]["sector"],
+                    "direction":      direction,
+                    "news_type":      "TECHNICAL_BREAKOUT",
+                    "news_type_hindi": f"Volume spike {d['volume_ratio']}x — Price action trade",
+                    "entry":          entry,
+                    "stop_loss":      sl,
+                    "target":         target,
+                    "risk_reward":    "1:1.5",
+                    "confidence_pct": 60,
+                    "confidence":     "MEDIUM",
+                    "smc_setup":      f"Volume {d['volume_ratio']}x normal, {d['change_pct']:+.2f}% move",
+                    "key_news":       [
+                        f"{STOCKS[sym]['name']} mein unusual volume activity",
+                        f"Price {d['change_pct']:+.2f}% move aaj",
+                        f"Volume {d['volume_ratio']}x normal se zyada"
+                    ],
+                    "impact_reason":  f"Volume spike + price momentum — technical setup",
+                    "risk_factors":   "News-based catalyst nahi — pure technical trade",
+                    "other_stocks_impacted": []
+                }
+                portfolio["pending_signal"] = fallback_signal
+                msgs = format_alert(fallback_signal, [])
+                for msg in msgs:
+                    await send_to_all(msg)
+                    await asyncio.sleep(1)
+                return
+
         await send_to_all(
-            f"📭 *Koi strong signal nahi mila*\n"
-            f"_{reason}_\n\n"
+            f"📭 *Scan complete*\n"
             f"📰 {len(articles)} news articles analyze ki\n"
-            f"🔗 {len(stock_news)} stocks news mein mention hue\n"
+            f"🔗 {len(stock_news)} stocks mention hue\n"
             f"🔄 Agli scan {SCAN_INTERVAL_MIN} min mein"
         )
 

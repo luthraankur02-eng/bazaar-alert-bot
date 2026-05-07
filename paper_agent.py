@@ -34,7 +34,7 @@ ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 MY_CHAT_ID         = os.environ.get("MY_CHAT_ID", "")
 COUSIN_CHAT_ID     = os.environ.get("COUSIN_CHAT_ID", "")
 SCAN_INTERVAL_MIN  = int(os.environ.get("SCAN_INTERVAL_MIN", "15"))
-PAPER_CAPITAL      = 10000.0
+PAPER_CAPITAL      = 20000.0
 
 # ══════════════════════════════════════════════════════════════════════
 # 📰 NEWS SOURCES — India ke sab bade financial news
@@ -489,7 +489,8 @@ def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
 
 async def check_positions(price_data: dict):
     to_close = []
-    for sym, pos in portfolio["positions"].items():
+    for pos_key, pos in portfolio["positions"].items():
+        sym = pos.get("symbol", pos_key.split("_")[0])
         if sym not in price_data:
             continue
         curr    = price_data[sym]["price"]
@@ -500,20 +501,30 @@ async def check_positions(price_data: dict):
             pnl     = (curr - pos["entry"]) * pos["qty"] if is_buy else (pos["entry"] - curr) * pos["qty"]
             label   = "🎯 TARGET HIT!" if hit_tgt else "🛑 STOP LOSS HIT"
             new_bal = portfolio["available"] + pos["cost"] + pnl
-            await send_to_all(
+            # Us user ko specifically bhejo
+            user_id = pos.get("user_id")
+            msg = (
                 f"{label}\n━━━━━━━━━━━━━━━━━━\n"
                 f"📊 *{pos['name']}*\n"
                 f"Entry: ₹{pos['entry']:,.2f} → Exit: ₹{curr:,.2f}\n"
                 f"Qty: {pos['qty']} | {'✅ Profit' if pnl>0 else '❌ Loss'}: {'+'if pnl>0 else ''}₹{pnl:,.0f}\n"
                 f"💼 Balance: ₹{new_bal:,.0f}"
             )
-            to_close.append((sym, pnl, pos["cost"]))
-    for sym, pnl, cost in to_close:
+            if user_id:
+                try:
+                    await bot_app.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
+                except:
+                    pass
+            else:
+                await send_to_all(msg)
+            to_close.append((pos_key, pnl, pos["cost"]))
+
+    for pos_key, pnl, cost in to_close:
         portfolio["available"] += cost + pnl
         if pnl > 0:
             portfolio["win_count"] += 1
-        portfolio["closed_trades"].append({"sym":sym,"pnl":pnl,"time":str(datetime.datetime.now())})
-        del portfolio["positions"][sym]
+        portfolio["closed_trades"].append({"sym": pos_key, "pnl": pnl, "time": str(datetime.datetime.now())})
+        del portfolio["positions"][pos_key]
 
 # ══════════════════════════════════════════════════════════════════════
 # 🔍 MAIN SCAN
@@ -712,47 +723,118 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text   = update.message.text.strip().upper()
-    signal = portfolio.get("pending_signal")
+    text    = update.message.text.strip().upper()
+    signal  = portfolio.get("pending_signal")
+    user_id = str(update.effective_user.id)
+
     if not signal:
         await update.message.reply_text("⚠️ Koi pending signal nahi. /scan karo.")
         return
+
     if text == "YES":
         # Daily limit check
         if not can_trade():
             await update.message.reply_text(
-                f"⛔ Aaj ke {MAX_TRADES_PER_DAY} trades ho gaye bhai!\n"
-                f"Kal subah naya din — phir le lena trade. 😄"
+                f"⛔ Aaj ke {MAX_TRADES_PER_DAY} trades ho gaye!\n"
+                f"Kal subah naya din — phir le lena. 😄"
             )
-            portfolio["pending_signal"] = None
             return
+
+        # Check agar is user ne already yeh trade liya hai
+        trade_key = f"{signal['symbol']}_{user_id}"
+        if trade_key in portfolio.get("user_trades", set()):
+            await update.message.reply_text("⚠️ Tune yeh trade already le liya hai!")
+            return
+
         price = signal["entry"]
         qty   = max(1, int(portfolio["available"] * 0.4 / price))
         cost  = round(qty * price, 2)
+
         if cost > portfolio["available"]:
-            await update.message.reply_text(f"❌ Capital kam! Cost: ₹{cost:,.0f} | Bal: ₹{portfolio['available']:,.0f}")
+            await update.message.reply_text(
+                f"❌ Capital kam! Cost: ₹{cost:,.0f} | Bal: ₹{portfolio['available']:,.0f}"
+            )
             return
+
         portfolio["available"] -= cost
-        portfolio["positions"][signal["symbol"]] = {
-            "name": signal["name"], "qty": qty, "entry": price,
-            "sl": signal["stop_loss"], "target": signal["target"],
-            "direction": signal["direction"], "cost": cost,
+        portfolio["positions"][f"{signal['symbol']}_{user_id}"] = {
+            "name":      signal["name"],
+            "symbol":    signal["symbol"],
+            "qty":       qty,
+            "entry":     price,
+            "sl":        signal["stop_loss"],
+            "target":    signal["target"],
+            "direction": signal["direction"],
+            "cost":      cost,
+            "user_id":   user_id,
         }
-        portfolio["pending_signal"] = None
-        portfolio["trades_today"]  += 1   # Counter badhao
+        # Track user trades
+        if "user_trades" not in portfolio:
+            portfolio["user_trades"] = set()
+        portfolio["user_trades"].add(trade_key)
+
+        portfolio["trades_today"] += 1
         left = trades_left()
+
+        # Sirf us user ko confirm bhejo
+        bot: Bot = bot_app.bot
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"✅ *Tera Trade Open!*\n"
+                    f"{'📈' if signal['direction']=='BUY' else '📉'} *{signal['name']}*\n"
+                    f"{signal['direction']} {qty} shares @ ₹{price:,.2f}\n"
+                    f"SL: ₹{signal['stop_loss']:,.2f} | T: ₹{signal['target']:,.2f}\n"
+                    f"💼 Balance: ₹{portfolio['available']:,.0f}\n"
+                    f"🔢 Trades: {portfolio['trades_today']}/{MAX_TRADES_PER_DAY}"
+                    + (f" | {left} aur bache" if left > 0 else " | Aaj bas itne!")
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Confirm msg failed: {e}")
+
+        # Dono ko batao ki kisne trade liya
+        user_name = update.effective_user.first_name or "Someone"
         await send_to_all(
-            f"✅ *Trade Open!*\n"
+            f"📊 *{user_name} ne trade liya!*\n"
             f"{'📈' if signal['direction']=='BUY' else '📉'} *{signal['name']}*\n"
-            f"{signal['direction']} {qty} shares @ ₹{price:,.2f}\n"
-            f"SL: ₹{signal['stop_loss']:,.2f} | T: ₹{signal['target']:,.2f}\n"
-            f"💼 Balance: ₹{portfolio['available']:,.0f}\n"
-            f"🔢 Aaj ke trades: {portfolio['trades_today']}/{MAX_TRADES_PER_DAY}"
-            + (f" | {left} aur bache" if left > 0 else " | Aaj bas itne!")
+            f"{signal['direction']} {qty} shares @ ₹{price:,.2f}\n\n"
+            f"_Doosra bhi YES bhej sakta hai apna trade lene ke liye!_"
         )
+
+        # Summary bhejo
+        closed    = portfolio["closed_trades"]
+        total_pnl = sum(t["pnl"] for t in closed)
+        wins      = portfolio["win_count"]
+        win_rate  = round(wins / len(closed) * 100, 1) if closed else 0
+        open_pos  = len(portfolio["positions"])
+        net_worth = portfolio["available"] + sum(p["cost"] for p in portfolio["positions"].values())
+
+        await send_to_all(
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📈 *Portfolio Summary*\n"
+            f"💰 Capital: ₹{PAPER_CAPITAL:,.0f}\n"
+            f"💼 Net Worth: ₹{net_worth:,.0f}\n"
+            f"{'📈' if total_pnl>=0 else '📉'} Total P&L: {'+'if total_pnl>=0 else ''}₹{total_pnl:,.0f}\n"
+            f"📂 Open Positions: {open_pos}\n"
+            f"✅ Wins: {wins} | ❌ Loss: {len(closed)-wins} | 🎯 {win_rate}%\n"
+            f"🔢 Aaj ke trades: {portfolio['trades_today']}/{MAX_TRADES_PER_DAY}"
+        )
+
     elif text == "NO":
-        portfolio["pending_signal"] = None
-        await send_to_all(f"👍 Skip — *{signal['name']}*")
+        # Sirf uss user ke liye skip — dusre ke liye pending raha
+        user_name = update.effective_user.first_name or "Someone"
+        bot: Bot = bot_app.bot
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"👍 *{user_name}* ne skip kiya — *{signal['name']}*",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(e)
     else:
         await update.message.reply_text("Sirf *YES* ya *NO* bhejo! 😄", parse_mode="Markdown")
 

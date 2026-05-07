@@ -440,6 +440,17 @@ Har stock ke liye mentally yeh check karo:
 - BOS ke baad retest pe entry lo
 - Strong volume ke saath BOS = institutional confirmation
 
+━━━━━━━━ TRADING STYLE ━━━━━━━━
+SWING TRADING — 2-3 din hold karo
+
+Rules:
+- SL: 3-4% (thoda zyada room do)
+- Target: 9-12% (3x SL = 1:3 R:R)
+- Hold time: 2-3 trading days
+- Entry: Current price pe ya thodi pullback pe
+- Large cap stocks prefer karo — easily exit mil jaye
+- News catalyst strong hona chahiye — 2-3 din tak effect rahega
+
 ━━━━━━━━ TERI TASK ━━━━━━━━
 1. Global market mood check karo
 2. TOP liquid sectors: IT | Pharma | Defence | Banking | FMCG | Energy | Auto | Cement
@@ -451,7 +462,7 @@ Har stock ke liye mentally yeh check karo:
 4. Market bullish → SIRF BUY | Bearish → SIRF SELL
 5. HAMESHA ek trade do — news na ho toh price action + SMC se decide karo
 6. SL: FVG ke neeche ya BOS level | Target: next FVG ya structure level
-7. Min R:R 1:3 — SL 1.5-2%, Target 4.5-6%
+7. Min R:R 1:3 — SL 3-4%, Target 9-12% (2-3 din swing)
 
 News type:
 ORDER_WIN | QUARTERLY_RESULT | MERGER_ACQUISITION | COMMODITY_IMPACT | POLICY_CHANGE | FII_DII | MANAGEMENT_CHANGE | GLOBAL_IMPACT | TECHNICAL_BREAKOUT | SECTOR_ROTATION | SMC_SETUP
@@ -553,7 +564,7 @@ def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
         f"⚠️ *Risk:* _{signal.get('risk_factors','N/A')}_\n"
         + (f"🔗 *Aur bhi dekhna:* {', '.join(others)}\n" if others else "")
         + f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"*{signal['direction']} Trade Plan:*\n"
+        f"*{signal['direction']} Swing Trade Plan (2-3 din):*\n"
         f"📍 Entry:   ₹{signal['entry']:,.2f}\n"
         f"🛑 SL:      ₹{signal['stop_loss']:,.2f} (-{sl_pct}%)\n"
         f"🎯 Target:  ₹{signal['target']:,.2f} (+{tgt_pct}%)\n"
@@ -672,9 +683,9 @@ async def run_scan(silent: bool = False):
                 sym, d = best
                 direction = "BUY" if d["change_pct"] >= 0 else "SELL"
                 entry  = d["price"]
-                # SL = 1.8%, Target = 5.4% → 1:3 ratio
-                sl     = round(entry * 0.982, 2) if direction == "BUY" else round(entry * 1.018, 2)
-                target = round(entry * 1.054, 2) if direction == "BUY" else round(entry * 0.946, 2)
+                # SL = 3.5%, Target = 10.5% → 1:3 ratio (swing 2-3 din)
+                sl     = round(entry * 0.965, 2) if direction == "BUY" else round(entry * 1.035, 2)
+                target = round(entry * 1.105, 2) if direction == "BUY" else round(entry * 0.895, 2)
                 fallback_signal = {
                     "found_signal":   True,
                     "global_market":  "NEUTRAL",

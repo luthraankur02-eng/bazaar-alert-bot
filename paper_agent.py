@@ -715,11 +715,25 @@ async def run_scan(silent: bool = False):
             f"🔄 Agli scan {SCAN_INTERVAL_MIN} min mein"
         )
 
+async def is_market_open() -> bool:
+    """NSE market hours check — 9:15 AM to 3:30 PM IST, Mon-Fri"""
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30)))
+    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
+    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+
 async def scan_loop():
     await asyncio.sleep(30)
     while True:
         try:
-            await run_scan()
+            if await is_market_open():
+                await run_scan()
+            else:
+                now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30)))
+                logger.info(f"Market band hai — {now.strftime('%I:%M %p')} IST")
         except Exception as e:
             logger.error(f"Scan error: {e}")
         await asyncio.sleep(SCAN_INTERVAL_MIN * 60)

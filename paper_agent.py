@@ -33,7 +33,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 MY_CHAT_ID         = os.environ.get("MY_CHAT_ID", "")
 COUSIN_CHAT_ID     = os.environ.get("COUSIN_CHAT_ID", "")
-SCAN_INTERVAL_MIN  = int(os.environ.get("SCAN_INTERVAL_MIN", "15"))
+SCAN_INTERVAL_MIN  = int(os.environ.get("SCAN_INTERVAL_MIN", "30"))
 PAPER_CAPITAL      = 20000.0
 
 # ══════════════════════════════════════════════════════════════════════
@@ -205,17 +205,100 @@ async def send_to_all(text: str, parse_mode: str = "Markdown"):
 # 📰 FETCH ALL NEWS
 # ══════════════════════════════════════════════════════════════════════
 
+async def fetch_nse_announcements(client: httpx.AsyncClient) -> list[dict]:
+    """NSE official real-time corporate announcements"""
+    articles = []
+    try:
+        # NSE corporate announcements — real-time
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://www.nseindia.com",
+        }
+        # First get cookies
+        await client.get("https://www.nseindia.com", headers=headers)
+        # Then fetch announcements
+        resp = await client.get(
+            "https://www.nseindia.com/api/corporate-announcements?index=equities",
+            headers=headers
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            for item in data[:30]:
+                symbol   = item.get("symbol", "")
+                subject  = item.get("subject", "")
+                company  = item.get("company", "")
+                ann_date = item.get("an_dt", "")
+                bm_desc  = item.get("desc", "")
+
+                if not subject:
+                    continue
+
+                articles.append({
+                    "source":   "NSE Official",
+                    "type":     "corporate",
+                    "headline": f"{company} ({symbol}): {subject}",
+                    "summary":  bm_desc[:400] if bm_desc else subject,
+                    "link":     f"https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+                    "symbol":   symbol,
+                    "realtime": True,
+                })
+            logger.info(f"NSE announcements: {len(articles)} fetched")
+    except Exception as e:
+        logger.debug(f"NSE announcements failed: {e}")
+    return articles
+
+
+async def fetch_bse_announcements(client: httpx.AsyncClient) -> list[dict]:
+    """BSE official real-time corporate announcements"""
+    articles = []
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        resp = await client.get(
+            "https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w?strCat=-1&strType=C&strScrip=&strSector=&strPeriod=D",
+            headers=headers, timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            announcements = data.get("Table", [])[:20]
+            for item in announcements:
+                company  = item.get("SLONGNAME", "")
+                subject  = item.get("HEADLINE", "")
+                scrip    = item.get("SCRIP_CD", "")
+                if not subject:
+                    continue
+                articles.append({
+                    "source":   "BSE Official",
+                    "type":     "corporate",
+                    "headline": f"{company}: {subject}",
+                    "summary":  subject,
+                    "link":     "https://www.bseindia.com/corporates/ann.html",
+                    "realtime": True,
+                })
+            logger.info(f"BSE announcements: {len(articles)} fetched")
+    except Exception as e:
+        logger.debug(f"BSE announcements failed: {e}")
+    return articles
+
+
 async def fetch_all_news() -> list[dict]:
     all_articles = []
-    # seen_headlines har scan pe reset karo — fresh news hamesha aaye
     portfolio["seen_headlines"] = set()
 
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+
+        # 1. NSE + BSE Real-time announcements PEHLE
+        nse_articles = await fetch_nse_announcements(client)
+        bse_articles = await fetch_bse_announcements(client)
+        all_articles.extend(nse_articles)
+        all_articles.extend(bse_articles)
+
+        # 2. RSS feeds
         for feed in NEWS_FEEDS:
             try:
                 resp   = await client.get(feed["url"])
                 parsed = feedparser.parse(resp.text)
-                for entry in parsed.entries[:10]:  # 8 se 10 kiya
+                for entry in parsed.entries[:10]:
                     headline = entry.get("title", "").strip()
                     if not headline:
                         continue
@@ -225,12 +308,14 @@ async def fetch_all_news() -> list[dict]:
                         "headline": headline,
                         "summary":  entry.get("summary", "")[:400],
                         "link":     entry.get("link", ""),
+                        "realtime": False,
                     })
             except Exception as e:
                 logger.debug(f"Feed failed {feed['name']}: {e}")
 
     portfolio["last_news_time"] = datetime.datetime.now().strftime("%I:%M %p")
-    logger.info(f"Fetched {len(all_articles)} articles")
+    realtime_count = sum(1 for a in all_articles if a.get("realtime"))
+    logger.info(f"Total: {len(all_articles)} articles ({realtime_count} real-time NSE/BSE)")
     return all_articles
 
 # ══════════════════════════════════════════════════════════════════════
@@ -267,19 +352,27 @@ async def get_price_data(symbols: list[str]) -> dict:
         tickers = yf.Tickers(" ".join(symbols))
         for sym in symbols:
             try:
-                hist = tickers.tickers[sym].history(period="5d", interval="1d")
-                if hist.empty or len(hist) < 2:
+                t = tickers.tickers[sym]
+                # Live 1-min price aaj ka
+                hist_1m = t.history(period="1d", interval="1m")
+                # 5 day daily for avg volume
+                hist_5d = t.history(period="5d", interval="1d")
+
+                if hist_1m.empty or hist_5d.empty:
                     continue
-                today_vol = int(hist["Volume"].iloc[-1])
-                avg_vol   = int(hist["Volume"].iloc[:-1].mean()) if len(hist) > 1 else today_vol
-                curr      = round(float(hist["Close"].iloc[-1]), 2)
-                prev      = round(float(hist["Close"].iloc[-2]), 2)
+
+                # LIVE current price — last 1min candle
+                curr      = round(float(hist_1m["Close"].iloc[-1]), 2)
+                today_vol = int(hist_1m["Volume"].sum())
+                avg_vol   = int(hist_5d["Volume"].mean()) if not hist_5d.empty else today_vol
+                prev      = round(float(hist_5d["Close"].iloc[-2]), 2) if len(hist_5d) > 1 else curr
+
                 result[sym] = {
-                    "price":        curr,
+                    "price":        curr,   # LIVE real-time price
                     "change_pct":   round((curr - prev) / prev * 100, 2),
                     "volume_ratio": round(today_vol / avg_vol, 2) if avg_vol else 1.0,
-                    "high":         round(float(hist["High"].iloc[-1]), 2),
-                    "low":          round(float(hist["Low"].iloc[-1]), 2),
+                    "high":         round(float(hist_1m["High"].max()), 2),
+                    "low":          round(float(hist_1m["Low"].min()), 2),
                 }
             except:
                 pass
@@ -358,7 +451,7 @@ Har stock ke liye mentally yeh check karo:
 4. Market bullish → SIRF BUY | Bearish → SIRF SELL
 5. HAMESHA ek trade do — news na ho toh price action + SMC se decide karo
 6. SL: FVG ke neeche ya BOS level | Target: next FVG ya structure level
-7. Min R:R 1:1.5
+7. Min R:R 1:3 — SL 1.5-2%, Target 4.5-6%
 
 News type:
 ORDER_WIN | QUARTERLY_RESULT | MERGER_ACQUISITION | COMMODITY_IMPACT | POLICY_CHANGE | FII_DII | MANAGEMENT_CHANGE | GLOBAL_IMPACT | TECHNICAL_BREAKOUT | SECTOR_ROTATION | SMC_SETUP
@@ -534,8 +627,9 @@ async def run_scan(silent: bool = False):
     portfolio["last_scan_time"] = datetime.datetime.now().strftime("%d %b, %I:%M %p")
     if not silent:
         await send_to_all(
-            f"🔍 *Full market intelligence scan...*\n"
-            f"📰 {len(NEWS_FEEDS)} news sources\n"
+            f"🔍 *Market scan shuru...*\n"
+            f"⚡ NSE/BSE real-time announcements\n"
+            f"📰 {len(NEWS_FEEDS)} RSS news sources\n"
             f"📊 {len(STOCKS)} NSE stocks"
         )
 
@@ -578,8 +672,9 @@ async def run_scan(silent: bool = False):
                 sym, d = best
                 direction = "BUY" if d["change_pct"] >= 0 else "SELL"
                 entry  = d["price"]
+                # SL = 1.8%, Target = 5.4% → 1:3 ratio
                 sl     = round(entry * 0.982, 2) if direction == "BUY" else round(entry * 1.018, 2)
-                target = round(entry * 1.03, 2)  if direction == "BUY" else round(entry * 0.97, 2)
+                target = round(entry * 1.054, 2) if direction == "BUY" else round(entry * 0.946, 2)
                 fallback_signal = {
                     "found_signal":   True,
                     "global_market":  "NEUTRAL",
@@ -593,7 +688,7 @@ async def run_scan(silent: bool = False):
                     "entry":          entry,
                     "stop_loss":      sl,
                     "target":         target,
-                    "risk_reward":    "1:1.5",
+                    "risk_reward":    "1:3",
                     "confidence_pct": 60,
                     "confidence":     "MEDIUM",
                     "smc_setup":      f"Volume {d['volume_ratio']}x normal, {d['change_pct']:+.2f}% move",

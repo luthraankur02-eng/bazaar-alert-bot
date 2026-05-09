@@ -345,39 +345,77 @@ def match_news_to_stocks(articles: list[dict]) -> dict:
 # 💹 PRICE DATA
 # ══════════════════════════════════════════════════════════════════════
 
-async def get_price_data(symbols: list[str]) -> dict:
-    result = {}
+async def get_nse_price(symbol: str, client: httpx.AsyncClient) -> dict | None:
+    """NSE India free real-time price"""
     try:
-        import yfinance as yf
-        tickers = yf.Tickers(" ".join(symbols))
-        for sym in symbols:
-            try:
-                t = tickers.tickers[sym]
-                # Live 1-min price aaj ka
-                hist_1m = t.history(period="1d", interval="1m")
-                # 5 day daily for avg volume
-                hist_5d = t.history(period="5d", interval="1d")
-
-                if hist_1m.empty or hist_5d.empty:
-                    continue
-
-                # LIVE current price — last 1min candle
-                curr      = round(float(hist_1m["Close"].iloc[-1]), 2)
-                today_vol = int(hist_1m["Volume"].sum())
-                avg_vol   = int(hist_5d["Volume"].mean()) if not hist_5d.empty else today_vol
-                prev      = round(float(hist_5d["Close"].iloc[-2]), 2) if len(hist_5d) > 1 else curr
-
-                result[sym] = {
-                    "price":        curr,   # LIVE real-time price
-                    "change_pct":   round((curr - prev) / prev * 100, 2),
-                    "volume_ratio": round(today_vol / avg_vol, 2) if avg_vol else 1.0,
-                    "high":         round(float(hist_1m["High"].max()), 2),
-                    "low":          round(float(hist_1m["Low"].min()), 2),
+        nse_sym = symbol.replace(".NS", "").replace("&", "%26")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "*/*",
+            "Referer": "https://www.nseindia.com",
+        }
+        resp = await client.get(
+            f"https://www.nseindia.com/api/quote-equity?symbol={nse_sym}",
+            headers=headers, timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            pd   = data.get("priceInfo", {})
+            curr = float(pd.get("lastPrice", 0))
+            prev = float(pd.get("previousClose", curr))
+            high = float(pd.get("intraDayHighLow", {}).get("max", curr))
+            low  = float(pd.get("intraDayHighLow", {}).get("min", curr))
+            if curr > 0:
+                return {
+                    "price":        round(curr, 2),
+                    "change_pct":   round((curr - prev) / prev * 100, 2) if prev else 0,
+                    "volume_ratio": 1.5,
+                    "high":         round(high, 2),
+                    "low":          round(low, 2),
                 }
-            except:
-                pass
-    except ImportError:
-        logger.warning("yfinance not installed")
+    except Exception as e:
+        logger.debug(f"NSE price failed {symbol}: {e}")
+    return None
+
+
+async def get_price_data(symbols: list[str]) -> dict:
+    """NSE real-time prices — free, no API key"""
+    result = {}
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        # NSE cookies set karo
+        try:
+            await client.get("https://www.nseindia.com", headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            })
+        except:
+            pass
+
+        for sym in symbols:
+            # Try NSE first
+            data = await get_nse_price(sym, client)
+            if data:
+                result[sym] = data
+            else:
+                # Fallback: yfinance
+                try:
+                    import yfinance as yf
+                    t    = yf.Ticker(sym)
+                    hist = t.history(period="1d", interval="5m")
+                    if not hist.empty:
+                        curr = round(float(hist["Close"].iloc[-1]), 2)
+                        prev = round(float(hist["Close"].iloc[0]), 2)
+                        result[sym] = {
+                            "price":        curr,
+                            "change_pct":   round((curr - prev) / prev * 100, 2) if prev else 0,
+                            "volume_ratio": 1.0,
+                            "high":         round(float(hist["High"].max()), 2),
+                            "low":          round(float(hist["Low"].min()), 2),
+                        }
+                except:
+                    pass
+            await asyncio.sleep(0.15)
+
+    logger.info(f"Prices: {len(result)}/{len(symbols)} stocks fetched")
     return result
 
 # ══════════════════════════════════════════════════════════════════════

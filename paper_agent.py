@@ -629,44 +629,214 @@ def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
 # 🔄 POSITION MONITOR
 # ══════════════════════════════════════════════════════════════════════
 
-async def check_positions(price_data: dict):
+async def smart_trade_manager(price_data: dict, articles: list[dict]):
+    """
+    Smart trade management:
+    ✅ Target hit → Auto close + P&L alert
+    ❌ SL hit → Auto close + loss alert
+    ⚠️ Near target + bad news → EXIT NOW
+    💡 Near SL + good news → HOLD — news support
+    📈 50% target done → Trail SL alert
+    """
     to_close = []
-    for pos_key, pos in portfolio["positions"].items():
-        sym = pos.get("symbol", pos_key.split("_")[0])
+
+    for pos_key, pos in list(portfolio["positions"].items()):
+        sym    = pos.get("symbol", pos_key.split("_")[0])
         if sym not in price_data:
             continue
-        curr    = price_data[sym]["price"]
-        is_buy  = pos["direction"] == "BUY"
-        hit_tgt = (is_buy and curr >= pos["target"]) or (not is_buy and curr <= pos["target"])
-        hit_sl  = (is_buy and curr <= pos["sl"])     or (not is_buy and curr >= pos["sl"])
-        if hit_tgt or hit_sl:
-            pnl     = (curr - pos["entry"]) * pos["qty"] if is_buy else (pos["entry"] - curr) * pos["qty"]
-            label   = "🎯 TARGET HIT!" if hit_tgt else "🛑 STOP LOSS HIT"
+
+        curr   = price_data[sym]["price"]
+        is_buy = pos["direction"] == "BUY"
+        entry  = pos["entry"]
+        sl     = pos["sl"]
+        target = pos["target"]
+        qty    = pos["qty"]
+        name   = pos["name"]
+        user_id = pos.get("user_id")
+
+        # P&L calculation
+        pnl     = (curr - entry) * qty if is_buy else (entry - curr) * qty
+        pnl_pct = round((curr - entry) / entry * 100, 2) if is_buy else round((entry - curr) / entry * 100, 2)
+
+        # Progress toward target
+        total_move  = abs(target - entry)
+        curr_move   = abs(curr - entry) if (is_buy and curr > entry) or (not is_buy and curr < entry) else 0
+        tgt_progress = round(curr_move / total_move * 100) if total_move > 0 else 0
+
+        # Distance from SL
+        sl_dist_pct = round(abs(curr - sl) / curr * 100, 2)
+
+        # ✅ TARGET HIT
+        hit_tgt = (is_buy and curr >= target) or (not is_buy and curr <= target)
+        # ❌ SL HIT
+        hit_sl  = (is_buy and curr <= sl) or (not is_buy and curr >= sl)
+
+        if hit_tgt:
             new_bal = portfolio["available"] + pos["cost"] + pnl
-            # Us user ko specifically bhejo
-            user_id = pos.get("user_id")
             msg = (
-                f"{label}\n━━━━━━━━━━━━━━━━━━\n"
-                f"📊 *{pos['name']}*\n"
-                f"Entry: ₹{pos['entry']:,.2f} → Exit: ₹{curr:,.2f}\n"
-                f"Qty: {pos['qty']} | {'✅ Profit' if pnl>0 else '❌ Loss'}: {'+'if pnl>0 else ''}₹{pnl:,.0f}\n"
-                f"💼 Balance: ₹{new_bal:,.0f}"
+                f"🎯 *TARGET HIT! PROFIT!*\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📊 *{name}*\n"
+                f"Entry: ₹{entry:,.2f} → Exit: ₹{curr:,.2f}\n"
+                f"Qty: {qty} | ✅ *Profit: +₹{pnl:,.0f}* (+{pnl_pct:.1f}%)\n"
+                f"💼 New Balance: ₹{new_bal:,.0f}\n\n"
+                f"🎉 Zabardast trade bhai!"
             )
-            if user_id:
-                try:
-                    await bot_app.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
-                except:
-                    pass
-            else:
-                await send_to_all(msg)
+            await _send_to_user(user_id, msg)
             to_close.append((pos_key, pnl, pos["cost"]))
 
+        elif hit_sl:
+            new_bal = portfolio["available"] + pos["cost"] + pnl
+            msg = (
+                f"🛑 *STOP LOSS HIT!*\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📊 *{name}*\n"
+                f"Entry: ₹{entry:,.2f} → Exit: ₹{curr:,.2f}\n"
+                f"Qty: {qty} | ❌ *Loss: ₹{pnl:,.0f}* ({pnl_pct:.1f}%)\n"
+                f"💼 Balance: ₹{new_bal:,.0f}\n\n"
+                f"💪 SL ne protect kiya — agli trade mein recover karenge!"
+            )
+            await _send_to_user(user_id, msg)
+            to_close.append((pos_key, pnl, pos["cost"]))
+
+        else:
+            # Check news for this stock
+            stock_arts = [a for a in articles if sym.replace(".NS","").lower() in (a["headline"]+a["summary"]).lower()]
+            bad_news_keywords  = ["loss","fall","down","decline","weak","negative","bearish","sell","downgrade","cut","concern","risk","crash","drop"]
+            good_news_keywords = ["profit","rise","up","growth","strong","positive","bullish","buy","upgrade","order","win","record","high","beat"]
+            news_text = " ".join([a["headline"] for a in stock_arts]).lower()
+            has_bad_news  = any(kw in news_text for kw in bad_news_keywords)
+            has_good_news = any(kw in news_text for kw in good_news_keywords)
+
+            # 🚨 INSTANT ALERT — Price reverse ho raha hai + bad news
+            # Example: Target 900, curr 830 (going up), bad news ayi → ALERT!
+            is_going_toward_target = (is_buy and curr > entry) or (not is_buy and curr < entry)
+            sharp_reversal = False
+
+            # Check agar position "winning" thi aur ab reverse ho rahi hai
+            if is_going_toward_target and tgt_progress >= 20 and has_bad_news:
+                sharp_reversal = True
+                alert_msg = (
+                    f"🚨 *TURANT ALERT — REVERSAL + BAD NEWS!*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 *{name}*\n"
+                    f"Entry: ₹{entry:,.2f} | Current: ₹{curr:,.2f}\n"
+                    f"P&L abhi: {'+'if pnl>=0 else ''}₹{pnl:,.0f} ({pnl_pct:+.1f}%)\n"
+                    f"Target: ₹{target:,.2f} | Progress: {tgt_progress}%\n\n"
+                    f"⚠️ *Bad News aa gayi:*\n"
+                    + "\n".join([f"  • _{a['headline'][:100]}_" for a in bad_arts[:3]])
+                    + f"\n\n💡 *Kya karna hai:*\n"
+                    f"• Profit hai → Exit consider karo\n"
+                    f"• Loss hai → SL ka wait karo ya cut karo\n"
+                    f"• Apna judgment use karo!"
+                )
+                await _send_to_user(user_id, alert_msg)
+
+            # Agar already alerted nahi aur good news ayi position ke favor mein
+            elif not is_going_toward_target and has_good_news and not pos.get("good_news_alerted"):
+                pos["good_news_alerted"] = True
+                alert_msg = (
+                    f"💡 *GOOD NEWS — POSITION KE FAVOR MEIN!*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 *{name}*\n"
+                    f"Current: ₹{curr:,.2f} | P&L: {'+'if pnl>=0 else ''}₹{pnl:,.0f}\n\n"
+                    f"✅ *Positive News:*\n"
+                    + "\n".join([f"  • _{a['headline'][:100]}_" for a in good_arts[:3]])
+                    + f"\n\n📈 *Position strong ho sakti hai — hold karo!*"
+                )
+                await _send_to_user(user_id, alert_msg)
+
+            # 📰 Regular news update (only if no instant alert sent)
+            if not sharp_reversal and stock_arts:
+                good_arts = [a for a in stock_arts if any(kw in a["headline"].lower() for kw in good_news_keywords)]
+                bad_arts  = [a for a in stock_arts if any(kw in a["headline"].lower() for kw in bad_news_keywords)]
+
+                news_msg = f"📰 *{name} — Latest News Update:*\n━━━━━━━━━━━━━━━━━━\n"
+                news_msg += f"Current: ₹{curr:,.2f} | P&L: {'+'if pnl>=0 else ''}₹{pnl:,.0f} ({pnl_pct:+.1f}%)\n"
+                news_msg += f"Target Progress: {tgt_progress}%\n\n"
+
+                if good_arts:
+                    news_msg += "✅ *Good News:*\n"
+                    for a in good_arts[:3]:
+                        news_msg += f"  • _{a['headline'][:100]}_\n"
+
+                if bad_arts:
+                    news_msg += "\n⚠️ *Bad News:*\n"
+                    for a in bad_arts[:3]:
+                        news_msg += f"  • _{a['headline'][:100]}_\n"
+
+                if not good_arts and not bad_arts:
+                    news_msg += "📭 Koi specific news nahi abhi"
+
+                await _send_to_user(user_id, news_msg)
+
+            # ⚠️ Near target (80%+ progress) + bad news → EXIT NOW
+            if tgt_progress >= 80 and has_bad_news:
+                msg = (
+                    f"⚠️ *EXIT NOW — TARGET NEAR + BAD NEWS!*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 *{name}* — {tgt_progress}% target complete\n"
+                    f"Current: ₹{curr:,.2f} | P&L: +₹{pnl:,.0f}\n\n"
+                    f"📰 *Bad news aa rahi hai:*\n"
+                    + "\n".join([f"• {a['headline'][:80]}" for a in stock_arts[:2]])
+                    + f"\n\n💡 *Profit book karo abhi!*"
+                )
+                await _send_to_user(user_id, msg)
+
+            # 💡 Near SL (within 1%) + good news → HOLD
+            elif sl_dist_pct <= 1.0 and has_good_news:
+                msg = (
+                    f"💡 *HOLD — NEWS SUPPORT HAI!*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 *{name}* — SL ke paas hai\n"
+                    f"Current: ₹{curr:,.2f} | SL: ₹{sl:,.2f}\n\n"
+                    f"📰 *Good news support de rahi hai:*\n"
+                    + "\n".join([f"• {a['headline'][:80]}" for a in stock_arts[:2]])
+                    + f"\n\n⚡ Position hold karo!"
+                )
+                await _send_to_user(user_id, msg)
+
+            # 📈 50%+ target reached → Trail SL
+            elif tgt_progress >= 50 and not pos.get("trailed"):
+                # New SL = entry price (breakeven ya thoda upar)
+                new_sl = round(entry * 1.01, 2) if is_buy else round(entry * 0.99, 2)
+                pos["trailed"] = True
+                msg = (
+                    f"📈 *TRAIL SL KARO! {tgt_progress}% TARGET DONE!*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 *{name}*\n"
+                    f"Current: ₹{curr:,.2f} | P&L: +₹{pnl:,.0f}\n\n"
+                    f"🛑 *Old SL: ₹{sl:,.2f}*\n"
+                    f"✅ *New SL: ₹{new_sl:,.2f}* (breakeven)\n\n"
+                    f"💡 Apne broker mein SL update karo — loss impossible ab!"
+                )
+                pos["sl"] = new_sl
+                await _send_to_user(user_id, msg)
+
+    # Close positions
     for pos_key, pnl, cost in to_close:
         portfolio["available"] += cost + pnl
         if pnl > 0:
             portfolio["win_count"] += 1
         portfolio["closed_trades"].append({"sym": pos_key, "pnl": pnl, "time": str(datetime.datetime.now())})
-        del portfolio["positions"][pos_key]
+        if pos_key in portfolio["positions"]:
+            del portfolio["positions"][pos_key]
+
+
+async def _send_to_user(user_id: str | None, msg: str):
+    """User ko message bhejo — agar user_id hai toh personal, warna dono ko"""
+    if user_id:
+        try:
+            await bot_app.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Send failed: {e}")
+    else:
+        await send_to_all(msg)
+
+
+async def check_positions(price_data: dict, articles: list[dict] = []):
+    """Wrapper — smart trade manager call karo"""
+    await smart_trade_manager(price_data, articles)
 
 # ══════════════════════════════════════════════════════════════════════
 # 🔍 MAIN SCAN
@@ -685,7 +855,7 @@ async def run_scan(silent: bool = False):
     articles   = await fetch_all_news()
     price_data = await get_price_data(list(STOCKS.keys()))
     if price_data:
-        await check_positions(price_data)
+        await check_positions(price_data, articles)
 
     stock_news = match_news_to_stocks(articles)
     result     = await ai_analyze_news(articles, stock_news, price_data)
@@ -772,6 +942,21 @@ async def is_market_open() -> bool:
     market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return market_open <= now <= market_close
+
+
+async def position_monitor_loop():
+    """Har 5 min mein positions check — instant alert"""
+    await asyncio.sleep(60)  # 1 min baad start
+    while True:
+        try:
+            if portfolio["positions"] and await is_market_open():
+                price_data = await get_price_data(list(STOCKS.keys()))
+                if price_data:
+                    articles = await fetch_all_news()
+                    await check_positions(price_data, articles)
+        except Exception as e:
+            logger.error(f"Position monitor error: {e}")
+        await asyncio.sleep(5 * 60)  # Har 5 min
 
 
 async def scan_loop():
@@ -1027,6 +1212,7 @@ async def main():
     )
 
     asyncio.create_task(scan_loop())
+    asyncio.create_task(position_monitor_loop())  # Har 5 min position check
     await asyncio.Event().wait()
 
 if __name__ == "__main__":

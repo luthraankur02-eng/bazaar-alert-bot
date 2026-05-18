@@ -818,7 +818,15 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
         portfolio["available"] += cost + pnl
         if pnl > 0:
             portfolio["win_count"] += 1
-        portfolio["closed_trades"].append({"sym": pos_key, "pnl": pnl, "time": str(datetime.datetime.now())})
+        portfolio["closed_trades"].append({
+            "sym":       pos_key,
+            "pnl":       pnl,
+            "time":      datetime.datetime.now().strftime("%d %b %Y %I:%M %p"),
+            "open_time": pos.get("open_time", "N/A"),
+            "entry":     pos.get("entry", 0),
+            "exit":      curr,
+            "direction": pos.get("direction", ""),
+        })
         if pos_key in portfolio["positions"]:
             del portfolio["positions"][pos_key]
 
@@ -1028,18 +1036,92 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     closed    = portfolio["closed_trades"]
     total_pnl = sum(t["pnl"] for t in closed)
     wins      = portfolio["win_count"]
-    win_rate  = round(wins/len(closed)*100,1) if closed else 0
-    net_worth = portfolio["available"] + sum(p["cost"] for p in portfolio["positions"].values())
-    await update.message.reply_text(
-        f"📈 *Trading Summary*\n━━━━━━━━━━━━━━━━\n"
-        f"💰 Start: ₹{PAPER_CAPITAL:,.0f}\n"
-        f"💼 Net Worth: ₹{net_worth:,.0f}\n"
-        f"{'📈' if total_pnl>=0 else '📉'} P&L: {'+'if total_pnl>=0 else ''}₹{total_pnl:,.0f}\n\n"
-        f"✅ Win: {wins} | ❌ Loss: {len(closed)-wins} | 🎯 {win_rate}%\n"
-        f"🕐 Last scan: {portfolio['last_scan_time'] or 'Abhi tak nahi'}\n"
-        f"📰 News: {portfolio['last_news_time'] or 'Abhi tak nahi'}",
-        parse_mode="Markdown"
+    losses    = len(closed) - wins
+    win_rate  = round(wins / len(closed) * 100, 1) if closed else 0
+    open_pos  = portfolio["positions"]
+    net_worth = portfolio["available"] + sum(p["cost"] for p in open_pos.values())
+    overall_pnl_pct = round((net_worth - PAPER_CAPITAL) / PAPER_CAPITAL * 100, 2)
+
+    # Get live prices for open positions
+    price_data = {}
+    if open_pos:
+        syms = list(set(p.get("symbol", k.split("_")[0]) for k, p in open_pos.items()))
+        price_data = await get_price_data(syms)
+
+    # ━━━ Message 1: Overall Summary ━━━
+    msg1 = (
+        f"📊 *FULL TRADING DASHBOARD*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 *Capital:* ₹{PAPER_CAPITAL:,.0f}\n"
+        f"💼 *Net Worth:* ₹{net_worth:,.0f}\n"
+        f"{'📈' if total_pnl>=0 else '📉'} *Total P&L:* {'+'if total_pnl>=0 else ''}₹{total_pnl:,.0f} ({'+' if overall_pnl_pct>=0 else ''}{overall_pnl_pct}%)\n"
+        f"💵 *Available:* ₹{portfolio['available']:,.0f}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 *Trade Stats:*\n"
+        f"✅ Wins:    {wins}\n"
+        f"❌ Losses:  {losses}\n"
+        f"🎯 Win Rate: {win_rate}%\n"
+        f"📦 Total Trades: {len(closed)}\n"
+        f"🔢 Aaj ke trades: {portfolio['trades_today']}/{MAX_TRADES_PER_DAY}\n"
     )
+    await update.message.reply_text(msg1, parse_mode="Markdown")
+
+    # ━━━ Message 2: Open Positions ━━━
+    if open_pos:
+        lines = ["📂 *OPEN POSITIONS:*\n━━━━━━━━━━━━━━━━━━"]
+        for pos_key, pos in open_pos.items():
+            sym  = pos.get("symbol", pos_key.split("_")[0])
+            curr = price_data.get(sym, {}).get("price", pos["entry"])
+            is_buy = pos["direction"] == "BUY"
+            live_pnl = (curr - pos["entry"]) * pos["qty"] if is_buy else (pos["entry"] - curr) * pos["qty"]
+            live_pnl_pct = round(live_pnl / pos["cost"] * 100, 2)
+            total_move = abs(pos["target"] - pos["entry"])
+            curr_move  = abs(curr - pos["entry"]) if (is_buy and curr > pos["entry"]) or (not is_buy and curr < pos["entry"]) else 0
+            progress   = round(curr_move / total_move * 100) if total_move > 0 else 0
+
+            # Progress bar
+            bars     = int(progress / 10)
+            prog_bar = "🟢" * bars + "⬜" * (10 - bars)
+
+            # Days open calculation
+            open_date = pos.get("open_date")
+            if open_date:
+                days_open = (datetime.datetime.now() - datetime.datetime.fromisoformat(open_date)).days
+                hours_open = int((datetime.datetime.now() - datetime.datetime.fromisoformat(open_date)).seconds / 3600)
+                time_str = f"{days_open} din {hours_open} ghante" if days_open > 0 else f"{hours_open} ghante"
+            else:
+                time_str = "N/A"
+
+            lines.append(
+                f"\n{'📈' if is_buy else '📉'} *{pos['name']}*\n"
+                f"🕐 Open: {pos.get('open_time', 'N/A')} ({time_str} se)\n"
+                f"Entry: ₹{pos['entry']:,.2f} | Now: ₹{curr:,.2f}\n"
+                f"SL: ₹{pos['sl']:,.2f} | Target: ₹{pos['target']:,.2f}\n"
+                f"P&L: {'+'if live_pnl>=0 else ''}₹{live_pnl:,.0f} ({'+' if live_pnl_pct>=0 else ''}{live_pnl_pct}%)\n"
+                f"Progress: {prog_bar} {progress}%\n"
+                f"Qty: {pos['qty']} shares | Cost: ₹{pos['cost']:,.0f}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    else:
+        await update.message.reply_text("📭 *Koi open position nahi hai abhi*", parse_mode="Markdown")
+
+    # ━━━ Message 3: Closed Trades History ━━━
+    if closed:
+        lines = ["📜 *CLOSED TRADES HISTORY:*\n━━━━━━━━━━━━━━━━━━"]
+        for i, t in enumerate(closed[-10:], 1):
+            emoji = "✅" if t["pnl"] >= 0 else "❌"
+            lines.append(
+                f"\n{emoji} *{i}. {t['sym'].split('_')[0]}*\n"
+                f"   {'📈 BUY' if t.get('direction')=='BUY' else '📉 SELL'} | "
+                f"Entry: ₹{t.get('entry',0):,.2f} → Exit: ₹{t.get('exit',0):,.2f}\n"
+                f"   P&L: {'+'if t['pnl']>=0 else ''}₹{t['pnl']:,.0f}\n"
+                f"   🕐 Open: {t.get('open_time','N/A')}\n"
+                f"   🏁 Close: {t.get('time','N/A')}"
+            )
+        lines.append(f"\n💰 *Total Closed P&L: {'+'if total_pnl>=0 else ''}₹{total_pnl:,.0f}*")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    else:
+        await update.message.reply_text("📭 *Abhi tak koi trade close nahi hua*", parse_mode="Markdown")
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -1110,6 +1192,8 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "direction": signal["direction"],
             "cost":      cost,
             "user_id":   user_id,
+            "open_time": datetime.datetime.now().strftime("%d %b %Y, %I:%M %p"),
+            "open_date": datetime.datetime.now().isoformat(),
         }
         # Track user trades
         if "user_trades" not in portfolio:

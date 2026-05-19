@@ -1,7 +1,21 @@
-anthropic>=0.40.0
+# ═══════════════════════════════════════════════════════════
+# 📦 requirements.txt — Bazaar Alert Bot
+# Angel One SmartAPI integration added
+# ═══════════════════════════════════════════════════════════
+
+# Core
+anthropic>=0.25.0
 python-telegram-bot>=21.0
-feedparser>=6.0.10
 httpx>=0.27.0
-yfinance==0.2.40
-multitasking==0.0.11
-peewee==3.17.0
+feedparser>=6.0.10
+
+# Market Data
+yfinance>=0.2.40
+
+# Angel One SmartAPI — Live NSE/BSE prices
+smartapi-python>=1.3.4       # Official Angel One SmartAPI Python SDK
+pyotp>=2.9.0                  # TOTP generation (auto OTP for Angel One login)
+logzero>=1.7.3                # SmartAPI internally uses this
+
+# Utilities
+python-dateutil>=2.9.0

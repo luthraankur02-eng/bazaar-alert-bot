@@ -1,7 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║       📊 NSE PAPER TRADING AGENT — ₹10,000 Capital             ║
+║       📊 NSE PAPER TRADING AGENT — ₹20,000 Capital             ║
 ║   Full News Intelligence — Orders, Results, M&A, Commodities   ║
+║   🔌 Angel One SmartAPI — Live Real-Time Prices                 ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 Kya kya analyze karta hai:
@@ -14,10 +15,16 @@ Kya kya analyze karta hai:
 ✅ Regulatory news (SEBI, CCI)
 ✅ Management changes, promoter activity
 ✅ Global market impact on Indian stocks
+
+Price Source:
+🥇 Angel One SmartAPI — Real-time LTP + OHLC + Volume
+🥈 NSE Website Scraping — Fallback
+🥉 yfinance — Last resort
 """
 
 import os, json, asyncio, logging, datetime, re
 import httpx, feedparser
+import pyotp
 from anthropic import AsyncAnthropic
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -35,6 +42,12 @@ MY_CHAT_ID         = os.environ.get("MY_CHAT_ID", "")
 COUSIN_CHAT_ID     = os.environ.get("COUSIN_CHAT_ID", "")
 SCAN_INTERVAL_MIN  = int(os.environ.get("SCAN_INTERVAL_MIN", "30"))
 PAPER_CAPITAL      = 20000.0
+
+# ── Angel One SmartAPI config ──────────────────────────────────────
+ANGEL_API_KEY    = os.environ.get("ANGEL_API_KEY", "")
+ANGEL_CLIENT_ID  = os.environ.get("ANGEL_CLIENT_ID", "")
+ANGEL_SECRET_KEY = os.environ.get("ANGEL_SECRET_KEY", "")   # 4-digit PIN
+ANGEL_TOTP_KEY   = os.environ.get("ANGEL_TOTP_KEY", "")     # Base32 TOTP secret
 
 # ══════════════════════════════════════════════════════════════════════
 # 📰 NEWS SOURCES — India ke sab bade financial news
@@ -146,6 +159,77 @@ COMMODITY_IMPACT = {
 }
 
 # ══════════════════════════════════════════════════════════════════════
+# 🔌 ANGEL ONE — Symbol Token Map (NSE symbol → Angel One token ID)
+# ══════════════════════════════════════════════════════════════════════
+
+NSE_SYMBOL_TOKENS = {
+    "RELIANCE.NS":    {"token": "2885",   "symbol": "RELIANCE-EQ"},
+    "TCS.NS":         {"token": "11536",  "symbol": "TCS-EQ"},
+    "HDFCBANK.NS":    {"token": "1333",   "symbol": "HDFCBANK-EQ"},
+    "ICICIBANK.NS":   {"token": "4963",   "symbol": "ICICIBANK-EQ"},
+    "INFY.NS":        {"token": "1594",   "symbol": "INFY-EQ"},
+    "SBIN.NS":        {"token": "3045",   "symbol": "SBIN-EQ"},
+    "TATAMOTORS.NS":  {"token": "3432",   "symbol": "TATAMOTORS-EQ"},
+    "BAJFINANCE.NS":  {"token": "317",    "symbol": "BAJFINANCE-EQ"},
+    "WIPRO.NS":       {"token": "3787",   "symbol": "WIPRO-EQ"},
+    "AXISBANK.NS":    {"token": "5900",   "symbol": "AXISBANK-EQ"},
+    "KOTAKBANK.NS":   {"token": "1922",   "symbol": "KOTAKBANK-EQ"},
+    "BHARTIARTL.NS":  {"token": "10604",  "symbol": "BHARTIARTL-EQ"},
+    "ITC.NS":         {"token": "1660",   "symbol": "ITC-EQ"},
+    "SUNPHARMA.NS":   {"token": "3351",   "symbol": "SUNPHARMA-EQ"},
+    "TATASTEEL.NS":   {"token": "3499",   "symbol": "TATASTEEL-EQ"},
+    "JSWSTEEL.NS":    {"token": "11723",  "symbol": "JSWSTEEL-EQ"},
+    "HINDALCO.NS":    {"token": "1363",   "symbol": "HINDALCO-EQ"},
+    "ONGC.NS":        {"token": "2475",   "symbol": "ONGC-EQ"},
+    "NTPC.NS":        {"token": "11630",  "symbol": "NTPC-EQ"},
+    "POWERGRID.NS":   {"token": "14977",  "symbol": "POWERGRID-EQ"},
+    "LT.NS":          {"token": "11483",  "symbol": "LT-EQ"},
+    "MARUTI.NS":      {"token": "10999",  "symbol": "MARUTI-EQ"},
+    "M&M.NS":         {"token": "2031",   "symbol": "M&M-EQ"},
+    "BAJAJ-AUTO.NS":  {"token": "16669",  "symbol": "BAJAJ-AUTO-EQ"},
+    "HCLTECH.NS":     {"token": "7229",   "symbol": "HCLTECH-EQ"},
+    "TECHM.NS":       {"token": "13538",  "symbol": "TECHM-EQ"},
+    "DRREDDY.NS":     {"token": "881",    "symbol": "DRREDDY-EQ"},
+    "CIPLA.NS":       {"token": "694",    "symbol": "CIPLA-EQ"},
+    "DIVISLAB.NS":    {"token": "10940",  "symbol": "DIVISLAB-EQ"},
+    "APOLLOHOSP.NS":  {"token": "157",    "symbol": "APOLLOHOSP-EQ"},
+    "HINDUNILVR.NS":  {"token": "1394",   "symbol": "HINDUNILVR-EQ"},
+    "NESTLEIND.NS":   {"token": "17963",  "symbol": "NESTLEIND-EQ"},
+    "BRITANNIA.NS":   {"token": "547",    "symbol": "BRITANNIA-EQ"},
+    "DABUR.NS":       {"token": "772",    "symbol": "DABUR-EQ"},
+    "ULTRACEMCO.NS":  {"token": "11532",  "symbol": "ULTRACEMCO-EQ"},
+    "GRASIM.NS":      {"token": "1232",   "symbol": "GRASIM-EQ"},
+    "AMBUJACEM.NS":   {"token": "1270",   "symbol": "AMBUJACEM-EQ"},
+    "ACC.NS":         {"token": "22",     "symbol": "ACC-EQ"},
+    "ADANIENT.NS":    {"token": "25",     "symbol": "ADANIENT-EQ"},
+    "ADANIPORTS.NS":  {"token": "15083",  "symbol": "ADANIPORTS-EQ"},
+    "ADANIGREEN.NS":  {"token": "236339", "symbol": "ADANIGREEN-EQ"},
+    "HAL.NS":         {"token": "2303",   "symbol": "HAL-EQ"},
+    "BEL.NS":         {"token": "383",    "symbol": "BEL-EQ"},
+    "IRCTC.NS":       {"token": "542048", "symbol": "IRCTC-EQ"},
+    "COALINDIA.NS":   {"token": "20374",  "symbol": "COALINDIA-EQ"},
+    "ZOMATO.NS":      {"token": "5097",   "symbol": "ZOMATO-EQ"},
+    "DLF.NS":         {"token": "14732",  "symbol": "DLF-EQ"},
+    "GODREJPROP.NS":  {"token": "3718",   "symbol": "GODREJPROP-EQ"},
+    "VEDL.NS":        {"token": "3063",   "symbol": "VEDL-EQ"},
+    "SAIL.NS":        {"token": "2963",   "symbol": "SAIL-EQ"},
+    "GAIL.NS":        {"token": "1207",   "symbol": "GAIL-EQ"},
+    "BPCL.NS":        {"token": "526",    "symbol": "BPCL-EQ"},
+    "IOC.NS":         {"token": "1624",   "symbol": "IOC-EQ"},
+    "TATAPOWER.NS":   {"token": "3426",   "symbol": "TATAPOWER-EQ"},
+    "HEROMOTOCO.NS":  {"token": "1348",   "symbol": "HEROMOTOCO-EQ"},
+    "EICHERMOT.NS":   {"token": "910",    "symbol": "EICHERMOT-EQ"},
+    "INDUSINDBK.NS":  {"token": "5258",   "symbol": "INDUSINDBK-EQ"},
+    "SBILIFE.NS":     {"token": "21808",  "symbol": "SBILIFE-EQ"},
+    "HDFCLIFE.NS":    {"token": "467",    "symbol": "HDFCLIFE-EQ"},
+    "LICI.NS":        {"token": "543526", "symbol": "LICI-EQ"},
+    "DMART.NS":       {"token": "542867", "symbol": "DMART-EQ"},
+    "NMDC.NS":        {"token": "2379",   "symbol": "NMDC-EQ"},
+    "RVNL.NS":        {"token": "543395", "symbol": "RVNL-EQ"},
+    "IRFC.NS":        {"token": "543257", "symbol": "IRFC-EQ"},
+}
+
+# ══════════════════════════════════════════════════════════════════════
 # 💼 PORTFOLIO
 # ══════════════════════════════════════════════════════════════════════
 
@@ -162,19 +246,17 @@ portfolio = {
     "last_scan_time":   None,
     "last_news_time":   None,
     "seen_headlines":   set(),
-    "trades_today":     0,           # Aaj kitne trades liye
-    "today_date":       None,        # Kaunse din ka count hai
+    "trades_today":     0,
+    "today_date":       None,
 }
 
 def reset_daily_limit():
-    """Naya din — counter reset"""
     today = datetime.date.today().isoformat()
     if portfolio["today_date"] != today:
-        portfolio["today_date"]  = today
+        portfolio["today_date"]   = today
         portfolio["trades_today"] = 0
 
 def can_trade() -> bool:
-    """Aaj aur trade le sakte hain?"""
     reset_daily_limit()
     return portfolio["trades_today"] < MAX_TRADES_PER_DAY
 
@@ -186,6 +268,177 @@ claude  = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger  = logging.getLogger(__name__)
 bot_app = None
+
+# ══════════════════════════════════════════════════════════════════════
+# 🔌 ANGEL ONE SESSION MANAGER
+# ══════════════════════════════════════════════════════════════════════
+
+class AngelOneSession:
+    """
+    Angel One SmartAPI — Live price data.
+    Auto-login with TOTP, 24h session auto-refresh.
+    """
+    def __init__(self):
+        self.obj           = None
+        self.auth_token    = None
+        self.refresh_token = None
+        self.last_login    = None
+        self.login_failed  = False
+        self._lock         = asyncio.Lock()
+
+    def _totp(self) -> str:
+        return pyotp.TOTP(ANGEL_TOTP_KEY).now()
+
+    async def login(self) -> bool:
+        async with self._lock:
+            try:
+                if not all([ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_SECRET_KEY, ANGEL_TOTP_KEY]):
+                    logger.warning("⚠️  Angel One credentials set nahi hain! Env vars check karo.")
+                    self.login_failed = True
+                    return False
+
+                from SmartApi import SmartConnect
+                self.obj  = SmartConnect(api_key=ANGEL_API_KEY)
+                totp_code = self._totp()
+                logger.info(f"🔐 Angel One login — Client: {ANGEL_CLIENT_ID}")
+
+                loop = asyncio.get_event_loop()
+                data = await loop.run_in_executor(
+                    None,
+                    lambda: self.obj.generateSession(ANGEL_CLIENT_ID, ANGEL_SECRET_KEY, totp_code)
+                )
+
+                if data and data.get("status") is True:
+                    self.auth_token    = data["data"]["jwtToken"]
+                    self.refresh_token = data["data"]["refreshToken"]
+                    self.last_login    = datetime.datetime.now()
+                    self.login_failed  = False
+                    logger.info("✅ Angel One login successful!")
+                    return True
+                else:
+                    msg = data.get("message", "Unknown") if data else "No response"
+                    logger.error(f"❌ Angel One login failed: {msg}")
+                    if "Invalid Token" in str(msg):
+                        logger.error("   → ANGEL_TOTP_KEY check karo (Base32 format mein hona chahiye)")
+                    elif "Invalid Client" in str(msg):
+                        logger.error("   → ANGEL_CLIENT_ID check karo")
+                    elif "Invalid Password" in str(msg) or "Invalid Pin" in str(msg):
+                        logger.error("   → ANGEL_SECRET_KEY (4-digit PIN) check karo")
+                    self.login_failed = True
+                    return False
+            except Exception as e:
+                logger.error(f"❌ Angel One login exception: {e}")
+                self.login_failed = True
+                return False
+
+    async def ensure_session(self) -> bool:
+        if self.login_failed:
+            return False
+        if self.obj is None or self.auth_token is None:
+            return await self.login()
+        if self.last_login:
+            age = (datetime.datetime.now() - self.last_login).total_seconds()
+            if age > 23 * 3600:
+                logger.info("🔄 Angel One session expire — re-login...")
+                return await self.login()
+        return True
+
+    async def get_bulk_market_data(self, symbols: list[str]) -> dict:
+        """
+        Bulk market data — ek call mein max 50 tokens.
+        Returns {symbol_ns: {price, change_pct, high, low, volume, volume_ratio, source}}
+        """
+        if not await self.ensure_session():
+            return {}
+
+        result   = {}
+        tokens   = []
+        sym_map  = {}  # token → symbol_ns
+
+        for sym in symbols:
+            info = NSE_SYMBOL_TOKENS.get(sym)
+            if info:
+                tokens.append(info["token"])
+                sym_map[info["token"]] = sym
+
+        if not tokens:
+            return {}
+
+        loop = asyncio.get_event_loop()
+        try:
+            for i in range(0, len(tokens), 50):
+                batch = tokens[i:i+50]
+                resp  = await loop.run_in_executor(
+                    None,
+                    lambda b=batch: self.obj.getMarketData("FULL", {"NSE": b})
+                )
+
+                if not (resp and resp.get("status") and resp.get("data")):
+                    # Session expire check
+                    if resp and resp.get("errorCode") in ["AB1010","AB1011","AG8001"]:
+                        logger.info("🔄 Angel session expired — re-login...")
+                        self.auth_token = None
+                        self.last_login = None
+                        if await self.login():
+                            resp = await loop.run_in_executor(
+                                None,
+                                lambda b=batch: self.obj.getMarketData("FULL", {"NSE": b})
+                            )
+                    if not (resp and resp.get("status") and resp.get("data")):
+                        continue
+
+                for item in resp["data"].get("fetched", []):
+                    token  = str(item.get("symbolToken", ""))
+                    sym_ns = sym_map.get(token)
+                    if not sym_ns:
+                        continue
+
+                    ltp   = float(item.get("ltp", 0))
+                    close = float(item.get("close", ltp))
+                    if ltp <= 0:
+                        continue
+
+                    change_pct = round((ltp - close) / close * 100, 2) if close else 0
+                    vol        = float(item.get("tradeVolume", 0))
+                    avg_vol    = float(item.get("avgTradeVolume", vol or 1))
+                    vol_ratio  = round(vol / avg_vol, 2) if avg_vol > 0 else 1.0
+
+                    result[sym_ns] = {
+                        "price":        round(ltp, 2),
+                        "change_pct":   change_pct,
+                        "open":         round(float(item.get("open", ltp)), 2),
+                        "high":         round(float(item.get("high", ltp)), 2),
+                        "low":          round(float(item.get("low", ltp)), 2),
+                        "prev_close":   round(close, 2),
+                        "volume":       int(vol),
+                        "volume_ratio": max(vol_ratio, 0.1),
+                        "source":       "AngelOne",
+                    }
+
+                await asyncio.sleep(0.3)
+
+        except Exception as e:
+            logger.error(f"Angel bulk data error: {e}")
+            if "token" in str(e).lower() or "session" in str(e).lower():
+                self.auth_token = None
+                self.last_login = None
+
+        logger.info(f"✅ AngelOne: {len(result)}/{len(symbols)} prices fetched")
+        return result
+
+    def status_text(self) -> str:
+        if not all([ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_SECRET_KEY, ANGEL_TOTP_KEY]):
+            return "❌ Angel One credentials set nahi hain Railway mein"
+        if self.login_failed:
+            return "❌ Angel One login failed — credentials check karo"
+        if self.auth_token:
+            t = self.last_login.strftime("%I:%M %p") if self.last_login else "?"
+            return f"✅ Angel One connected — Login: {t}"
+        return "⏳ Angel One: connecting..."
+
+
+# Global Angel One session
+angel = AngelOneSession()
 
 # ══════════════════════════════════════════════════════════════════════
 # 📤 SEND TO BOTH — Ankur + Cousin
@@ -209,15 +462,12 @@ async def fetch_nse_announcements(client: httpx.AsyncClient) -> list[dict]:
     """NSE official real-time corporate announcements"""
     articles = []
     try:
-        # NSE corporate announcements — real-time
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/json",
             "Referer": "https://www.nseindia.com",
         }
-        # First get cookies
         await client.get("https://www.nseindia.com", headers=headers)
-        # Then fetch announcements
         resp = await client.get(
             "https://www.nseindia.com/api/corporate-announcements?index=equities",
             headers=headers
@@ -225,21 +475,18 @@ async def fetch_nse_announcements(client: httpx.AsyncClient) -> list[dict]:
         if resp.status_code == 200:
             data = resp.json()
             for item in data[:30]:
-                symbol   = item.get("symbol", "")
-                subject  = item.get("subject", "")
-                company  = item.get("company", "")
-                ann_date = item.get("an_dt", "")
-                bm_desc  = item.get("desc", "")
-
+                symbol  = item.get("symbol", "")
+                subject = item.get("subject", "")
+                company = item.get("company", "")
+                bm_desc = item.get("desc", "")
                 if not subject:
                     continue
-
                 articles.append({
                     "source":   "NSE Official",
                     "type":     "corporate",
                     "headline": f"{company} ({symbol}): {subject}",
                     "summary":  bm_desc[:400] if bm_desc else subject,
-                    "link":     f"https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+                    "link":     "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
                     "symbol":   symbol,
                     "realtime": True,
                 })
@@ -260,11 +507,9 @@ async def fetch_bse_announcements(client: httpx.AsyncClient) -> list[dict]:
         )
         if resp.status_code == 200:
             data = resp.json()
-            announcements = data.get("Table", [])[:20]
-            for item in announcements:
-                company  = item.get("SLONGNAME", "")
-                subject  = item.get("HEADLINE", "")
-                scrip    = item.get("SCRIP_CD", "")
+            for item in data.get("Table", [])[:20]:
+                company = item.get("SLONGNAME", "")
+                subject = item.get("HEADLINE", "")
                 if not subject:
                     continue
                 articles.append({
@@ -286,14 +531,11 @@ async def fetch_all_news() -> list[dict]:
     portfolio["seen_headlines"] = set()
 
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-
-        # 1. NSE + BSE Real-time announcements PEHLE
         nse_articles = await fetch_nse_announcements(client)
         bse_articles = await fetch_bse_announcements(client)
         all_articles.extend(nse_articles)
         all_articles.extend(bse_articles)
 
-        # 2. RSS feeds
         for feed in NEWS_FEEDS:
             try:
                 resp   = await client.get(feed["url"])
@@ -342,11 +584,11 @@ def match_news_to_stocks(articles: list[dict]) -> dict:
     return stock_news
 
 # ══════════════════════════════════════════════════════════════════════
-# 💹 PRICE DATA
+# 💹 PRICE DATA — Angel One Primary + NSE Fallback
 # ══════════════════════════════════════════════════════════════════════
 
 async def get_nse_price(symbol: str, client: httpx.AsyncClient) -> dict | None:
-    """NSE India free real-time price"""
+    """NSE India scraping — fallback"""
     try:
         nse_sym = symbol.replace(".NS", "").replace("&", "%26")
         headers = {
@@ -372,17 +614,17 @@ async def get_nse_price(symbol: str, client: httpx.AsyncClient) -> dict | None:
                     "volume_ratio": 1.5,
                     "high":         round(high, 2),
                     "low":          round(low, 2),
+                    "source":       "NSE-Scrape",
                 }
     except Exception as e:
         logger.debug(f"NSE price failed {symbol}: {e}")
     return None
 
 
-async def get_price_data(symbols: list[str]) -> dict:
-    """NSE real-time prices — free, no API key"""
+async def _nse_yfinance_fallback(symbols: list[str]) -> dict:
+    """NSE scraping + yfinance fallback prices"""
     result = {}
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        # NSE cookies set karo
         try:
             await client.get("https://www.nseindia.com", headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -391,12 +633,10 @@ async def get_price_data(symbols: list[str]) -> dict:
             pass
 
         for sym in symbols:
-            # Try NSE first
             data = await get_nse_price(sym, client)
             if data:
                 result[sym] = data
             else:
-                # Fallback: yfinance
                 try:
                     import yfinance as yf
                     t    = yf.Ticker(sym)
@@ -410,12 +650,43 @@ async def get_price_data(symbols: list[str]) -> dict:
                             "volume_ratio": 1.0,
                             "high":         round(float(hist["High"].max()), 2),
                             "low":          round(float(hist["Low"].min()), 2),
+                            "source":       "yfinance",
                         }
                 except:
                     pass
             await asyncio.sleep(0.15)
 
-    logger.info(f"Prices: {len(result)}/{len(symbols)} stocks fetched")
+    logger.info(f"Fallback: {len(result)}/{len(symbols)} stocks")
+    return result
+
+
+async def get_price_data(symbols: list[str]) -> dict:
+    """
+    Live NSE prices — 3 tier system:
+    1. Angel One SmartAPI (real-time LTP + OHLC + Volume) ← PRIMARY
+    2. NSE website scraping ← FALLBACK
+    3. yfinance ← LAST RESORT
+    """
+    result = {}
+
+    # ── Tier 1: Angel One bulk market data ────────────────────────
+    angel_data = await angel.get_bulk_market_data(symbols)
+    result.update(angel_data)
+
+    # ── Tier 2+3: NSE scraping + yfinance for missed symbols ──────
+    missed = [s for s in symbols if s not in result]
+    if missed:
+        logger.info(f"📡 Fallback for {len(missed)} stocks (NSE + yfinance)...")
+        fallback_data = await _nse_yfinance_fallback(missed)
+        result.update(fallback_data)
+
+    # Summary log
+    angel_count    = sum(1 for d in result.values() if d.get("source") == "AngelOne")
+    fallback_count = len(result) - angel_count
+    logger.info(
+        f"📊 Prices: {len(result)}/{len(symbols)} | "
+        f"AngelOne: {angel_count} | Fallback: {fallback_count}"
+    )
     return result
 
 # ══════════════════════════════════════════════════════════════════════
@@ -436,7 +707,6 @@ async def ai_analyze_news(articles: list[dict], stock_news: dict, price_data: di
         price_info = f"₹{price_data[sym]['price']} ({price_data[sym]['change_pct']:+.2f}%)" if sym in price_data else "NA"
         stock_news_text += f"\n• {name} ({sym}) [{price_info}]: {headlines}"
 
-    # Top movers from price data
     movers_text = ""
     if price_data:
         sorted_by_move = sorted(price_data.items(), key=lambda x: abs(x[1]['change_pct']), reverse=True)
@@ -541,7 +811,6 @@ Respond ONLY in JSON:
         )
         raw  = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
         data = json.loads(raw)
-        # Update global market bias
         if data.get("global_market"):
             market_bias["direction"] = data["global_market"]
             market_bias["reason"]    = data.get("global_reason","")
@@ -581,12 +850,10 @@ def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
     others   = [STOCKS[s]["name"] for s in signal.get("other_stocks_impacted",[]) if s in STOCKS][:3]
     key_news = "\n".join([f"  • {n}" for n in signal.get("key_news", [])[:4]])
 
-    # Global market mood
-    g_mood = signal.get("global_market", market_bias["direction"])
-    g_emo  = {"BULLISH":"🟢 Bullish","BEARISH":"🔴 Bearish","NEUTRAL":"🟡 Neutral"}.get(g_mood,"🟡 Neutral")
+    g_mood   = signal.get("global_market", market_bias["direction"])
+    g_emo    = {"BULLISH":"🟢 Bullish","BEARISH":"🔴 Bearish","NEUTRAL":"🟡 Neutral"}.get(g_mood,"🟡 Neutral")
     g_reason = signal.get("global_reason", market_bias.get("reason",""))
 
-    # Message 1: Main alert
     msg1 = (
         f"🚨 *{label}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -614,7 +881,6 @@ def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
     )
     messages.append(msg1)
 
-    # Message 2: All related news
     if stock_articles:
         lines = [f"📰 *{signal['name']} — Saari Related News:*\n━━━━━━━━━━━━━━━━━━"]
         for i, art in enumerate(stock_articles[:10], 1):
@@ -630,14 +896,6 @@ def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
 # ══════════════════════════════════════════════════════════════════════
 
 async def smart_trade_manager(price_data: dict, articles: list[dict]):
-    """
-    Smart trade management:
-    ✅ Target hit → Auto close + P&L alert
-    ❌ SL hit → Auto close + loss alert
-    ⚠️ Near target + bad news → EXIT NOW
-    💡 Near SL + good news → HOLD — news support
-    📈 50% target done → Trail SL alert
-    """
     to_close = []
 
     for pos_key, pos in list(portfolio["positions"].items()):
@@ -645,31 +903,25 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
         if sym not in price_data:
             continue
 
-        curr   = price_data[sym]["price"]
-        is_buy = pos["direction"] == "BUY"
-        entry  = pos["entry"]
-        sl     = pos["sl"]
-        target = pos["target"]
-        qty    = pos["qty"]
-        name   = pos["name"]
+        curr    = price_data[sym]["price"]
+        is_buy  = pos["direction"] == "BUY"
+        entry   = pos["entry"]
+        sl      = pos["sl"]
+        target  = pos["target"]
+        qty     = pos["qty"]
+        name    = pos["name"]
         user_id = pos.get("user_id")
 
-        # P&L calculation
         pnl     = (curr - entry) * qty if is_buy else (entry - curr) * qty
         pnl_pct = round((curr - entry) / entry * 100, 2) if is_buy else round((entry - curr) / entry * 100, 2)
 
-        # Progress toward target
-        total_move  = abs(target - entry)
-        curr_move   = abs(curr - entry) if (is_buy and curr > entry) or (not is_buy and curr < entry) else 0
+        total_move   = abs(target - entry)
+        curr_move    = abs(curr - entry) if (is_buy and curr > entry) or (not is_buy and curr < entry) else 0
         tgt_progress = round(curr_move / total_move * 100) if total_move > 0 else 0
+        sl_dist_pct  = round(abs(curr - sl) / curr * 100, 2)
 
-        # Distance from SL
-        sl_dist_pct = round(abs(curr - sl) / curr * 100, 2)
-
-        # ✅ TARGET HIT
         hit_tgt = (is_buy and curr >= target) or (not is_buy and curr <= target)
-        # ❌ SL HIT
-        hit_sl  = (is_buy and curr <= sl) or (not is_buy and curr >= sl)
+        hit_sl  = (is_buy and curr <= sl)     or (not is_buy and curr >= sl)
 
         if hit_tgt:
             new_bal = portfolio["available"] + pos["cost"] + pnl
@@ -700,22 +952,19 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
             to_close.append((pos_key, pnl, pos["cost"]))
 
         else:
-            # Check news for this stock
             stock_arts = [a for a in articles if sym.replace(".NS","").lower() in (a["headline"]+a["summary"]).lower()]
             bad_news_keywords  = ["loss","fall","down","decline","weak","negative","bearish","sell","downgrade","cut","concern","risk","crash","drop"]
             good_news_keywords = ["profit","rise","up","growth","strong","positive","bullish","buy","upgrade","order","win","record","high","beat"]
-            news_text = " ".join([a["headline"] for a in stock_arts]).lower()
+            news_text     = " ".join([a["headline"] for a in stock_arts]).lower()
             has_bad_news  = any(kw in news_text for kw in bad_news_keywords)
             has_good_news = any(kw in news_text for kw in good_news_keywords)
 
-            # 🚨 INSTANT ALERT — Price reverse ho raha hai + bad news
-            # Example: Target 900, curr 830 (going up), bad news ayi → ALERT!
             is_going_toward_target = (is_buy and curr > entry) or (not is_buy and curr < entry)
             sharp_reversal = False
 
-            # Check agar position "winning" thi aur ab reverse ho rahi hai
             if is_going_toward_target and tgt_progress >= 20 and has_bad_news:
                 sharp_reversal = True
+                bad_arts = [a for a in stock_arts if any(kw in a["headline"].lower() for kw in bad_news_keywords)]
                 alert_msg = (
                     f"🚨 *TURANT ALERT — REVERSAL + BAD NEWS!*\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
@@ -732,9 +981,9 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
                 )
                 await _send_to_user(user_id, alert_msg)
 
-            # Agar already alerted nahi aur good news ayi position ke favor mein
             elif not is_going_toward_target and has_good_news and not pos.get("good_news_alerted"):
                 pos["good_news_alerted"] = True
+                good_arts = [a for a in stock_arts if any(kw in a["headline"].lower() for kw in good_news_keywords)]
                 alert_msg = (
                     f"💡 *GOOD NEWS — POSITION KE FAVOR MEIN!*\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
@@ -746,31 +995,25 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
                 )
                 await _send_to_user(user_id, alert_msg)
 
-            # 📰 Regular news update (only if no instant alert sent)
             if not sharp_reversal and stock_arts:
                 good_arts = [a for a in stock_arts if any(kw in a["headline"].lower() for kw in good_news_keywords)]
                 bad_arts  = [a for a in stock_arts if any(kw in a["headline"].lower() for kw in bad_news_keywords)]
 
-                news_msg = f"📰 *{name} — Latest News Update:*\n━━━━━━━━━━━━━━━━━━\n"
+                news_msg  = f"📰 *{name} — Latest News Update:*\n━━━━━━━━━━━━━━━━━━\n"
                 news_msg += f"Current: ₹{curr:,.2f} | P&L: {'+'if pnl>=0 else ''}₹{pnl:,.0f} ({pnl_pct:+.1f}%)\n"
                 news_msg += f"Target Progress: {tgt_progress}%\n\n"
-
                 if good_arts:
                     news_msg += "✅ *Good News:*\n"
                     for a in good_arts[:3]:
                         news_msg += f"  • _{a['headline'][:100]}_\n"
-
                 if bad_arts:
                     news_msg += "\n⚠️ *Bad News:*\n"
                     for a in bad_arts[:3]:
                         news_msg += f"  • _{a['headline'][:100]}_\n"
-
                 if not good_arts and not bad_arts:
                     news_msg += "📭 Koi specific news nahi abhi"
-
                 await _send_to_user(user_id, news_msg)
 
-            # ⚠️ Near target (80%+ progress) + bad news → EXIT NOW
             if tgt_progress >= 80 and has_bad_news:
                 msg = (
                     f"⚠️ *EXIT NOW — TARGET NEAR + BAD NEWS!*\n"
@@ -783,7 +1026,6 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
                 )
                 await _send_to_user(user_id, msg)
 
-            # 💡 Near SL (within 1%) + good news → HOLD
             elif sl_dist_pct <= 1.0 and has_good_news:
                 msg = (
                     f"💡 *HOLD — NEWS SUPPORT HAI!*\n"
@@ -796,9 +1038,7 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
                 )
                 await _send_to_user(user_id, msg)
 
-            # 📈 50%+ target reached → Trail SL
             elif tgt_progress >= 50 and not pos.get("trailed"):
-                # New SL = entry price (breakeven ya thoda upar)
                 new_sl = round(entry * 1.01, 2) if is_buy else round(entry * 0.99, 2)
                 pos["trailed"] = True
                 msg = (
@@ -813,7 +1053,6 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
                 pos["sl"] = new_sl
                 await _send_to_user(user_id, msg)
 
-    # Close positions
     for pos_key, pnl, cost in to_close:
         portfolio["available"] += cost + pnl
         if pnl > 0:
@@ -822,17 +1061,16 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
             "sym":       pos_key,
             "pnl":       pnl,
             "time":      datetime.datetime.now().strftime("%d %b %Y %I:%M %p"),
-            "open_time": pos.get("open_time", "N/A"),
-            "entry":     pos.get("entry", 0),
-            "exit":      curr,
-            "direction": pos.get("direction", ""),
+            "open_time": portfolio["positions"].get(pos_key, {}).get("open_time", "N/A"),
+            "entry":     portfolio["positions"].get(pos_key, {}).get("entry", 0),
+            "exit":      price_data.get(pos_key.split("_")[0], {}).get("price", 0),
+            "direction": portfolio["positions"].get(pos_key, {}).get("direction", ""),
         })
         if pos_key in portfolio["positions"]:
             del portfolio["positions"][pos_key]
 
 
 async def _send_to_user(user_id: str | None, msg: str):
-    """User ko message bhejo — agar user_id hai toh personal, warna dono ko"""
     if user_id:
         try:
             await bot_app.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
@@ -843,7 +1081,6 @@ async def _send_to_user(user_id: str | None, msg: str):
 
 
 async def check_positions(price_data: dict, articles: list[dict] = []):
-    """Wrapper — smart trade manager call karo"""
     await smart_trade_manager(price_data, articles)
 
 # ══════════════════════════════════════════════════════════════════════
@@ -857,7 +1094,8 @@ async def run_scan(silent: bool = False):
             f"🔍 *Market scan shuru...*\n"
             f"⚡ NSE/BSE real-time announcements\n"
             f"📰 {len(NEWS_FEEDS)} RSS news sources\n"
-            f"📊 {len(STOCKS)} NSE stocks"
+            f"📊 {len(STOCKS)} NSE stocks\n"
+            f"🔌 {angel.status_text()}"
         )
 
     articles   = await fetch_all_news()
@@ -869,7 +1107,6 @@ async def run_scan(silent: bool = False):
     result     = await ai_analyze_news(articles, stock_news, price_data)
     portfolio["total_signals"] += 1
 
-    # Daily trade limit check
     if not can_trade():
         await send_to_all(
             f"⛔ *Aaj ke {MAX_TRADES_PER_DAY} trades ho gaye!*\n"
@@ -887,46 +1124,43 @@ async def run_scan(silent: bool = False):
             await send_to_all(msg)
             await asyncio.sleep(1)
     else:
-        # Fallback — price data se best mover dhundo aur signal do
         if price_data:
-            # Sabse zyada volume wala liquid stock lo
             best = max(
                 [(s,d) for s,d in price_data.items() if s in STOCKS],
                 key=lambda x: x[1]["volume_ratio"],
                 default=None
             )
             if best:
-                sym, d = best
+                sym, d    = best
                 direction = "BUY" if d["change_pct"] >= 0 else "SELL"
-                entry  = d["price"]
-                # SL = 3.5%, Target = 10.5% → 1:3 ratio (swing 2-3 din)
-                sl     = round(entry * 0.965, 2) if direction == "BUY" else round(entry * 1.035, 2)
-                target = round(entry * 1.105, 2) if direction == "BUY" else round(entry * 0.895, 2)
+                entry     = d["price"]
+                sl        = round(entry * 0.965, 2) if direction == "BUY" else round(entry * 1.035, 2)
+                target    = round(entry * 1.105, 2) if direction == "BUY" else round(entry * 0.895, 2)
                 fallback_signal = {
-                    "found_signal":   True,
-                    "global_market":  "NEUTRAL",
-                    "global_reason":  "Price action based signal",
-                    "symbol":         sym,
-                    "name":           STOCKS[sym]["name"],
-                    "sector":         STOCKS[sym]["sector"],
-                    "direction":      direction,
-                    "news_type":      "TECHNICAL_BREAKOUT",
-                    "news_type_hindi": f"Volume spike {d['volume_ratio']}x — Price action trade",
-                    "entry":          entry,
-                    "stop_loss":      sl,
-                    "target":         target,
-                    "risk_reward":    "1:3",
-                    "confidence_pct": 60,
-                    "confidence":     "MEDIUM",
-                    "smc_setup":      f"Volume {d['volume_ratio']}x normal, {d['change_pct']:+.2f}% move",
-                    "key_news":       [
+                    "found_signal":         True,
+                    "global_market":        "NEUTRAL",
+                    "global_reason":        "Price action based signal",
+                    "symbol":               sym,
+                    "name":                 STOCKS[sym]["name"],
+                    "sector":               STOCKS[sym]["sector"],
+                    "direction":            direction,
+                    "news_type":            "TECHNICAL_BREAKOUT",
+                    "news_type_hindi":      f"Volume spike {d['volume_ratio']}x — Price action trade",
+                    "entry":                entry,
+                    "stop_loss":            sl,
+                    "target":               target,
+                    "risk_reward":          "1:3",
+                    "confidence_pct":       60,
+                    "confidence":           "MEDIUM",
+                    "smc_setup":            f"Volume {d['volume_ratio']}x normal, {d['change_pct']:+.2f}% move",
+                    "key_news":             [
                         f"{STOCKS[sym]['name']} mein unusual volume activity",
                         f"Price {d['change_pct']:+.2f}% move aaj",
                         f"Volume {d['volume_ratio']}x normal se zyada"
                     ],
-                    "impact_reason":  f"Volume spike + price momentum — technical setup",
-                    "risk_factors":   "News-based catalyst nahi — pure technical trade",
-                    "other_stocks_impacted": []
+                    "impact_reason":        "Volume spike + price momentum — technical setup",
+                    "risk_factors":         "News-based catalyst nahi — pure technical trade",
+                    "other_stocks_impacted":[]
                 }
                 portfolio["pending_signal"] = fallback_signal
                 msgs = format_alert(fallback_signal, [])
@@ -942,10 +1176,10 @@ async def run_scan(silent: bool = False):
             f"🔄 Agli scan {SCAN_INTERVAL_MIN} min mein"
         )
 
+
 async def is_market_open() -> bool:
-    """NSE market hours check — 9:15 AM to 3:30 PM IST, Mon-Fri"""
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30)))
-    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+    if now.weekday() >= 5:
         return False
     market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -953,8 +1187,7 @@ async def is_market_open() -> bool:
 
 
 async def position_monitor_loop():
-    """Har 5 min mein positions check — instant alert"""
-    await asyncio.sleep(60)  # 1 min baad start
+    await asyncio.sleep(60)
     while True:
         try:
             if portfolio["positions"] and await is_market_open():
@@ -964,7 +1197,7 @@ async def position_monitor_loop():
                     await check_positions(price_data, articles)
         except Exception as e:
             logger.error(f"Position monitor error: {e}")
-        await asyncio.sleep(5 * 60)  # Har 5 min
+        await asyncio.sleep(5 * 60)
 
 
 async def scan_loop():
@@ -996,13 +1229,47 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🏛️ Govt/RBI policy changes\n"
         "💰 FII/DII buying selling\n"
         "🌍 Global market impact\n\n"
-        "Commands: /scan /news /portfolio /summary /help",
+        "Commands: /scan /news /portfolio /summary /status /help",
         parse_mode="Markdown"
     )
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Angel One + Agent live status"""
+    market_status = "🟢 OPEN" if await is_market_open() else "🔴 CLOSED"
+    reset_daily_limit()
+
+    # Source breakdown
+    source_info = ""
+    if angel.auth_token:
+        source_info = "📊 Price Source: Angel One SmartAPI (Live)"
+    elif angel.login_failed:
+        source_info = "📊 Price Source: NSE Fallback (Angel One failed)"
+    else:
+        source_info = "📊 Price Source: NSE Scraping (Angel One connecting...)"
+
+    msg = (
+        f"🔌 *Angel One SmartAPI*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{angel.status_text()}\n\n"
+        f"📈 *Market:* {market_status}\n"
+        f"{source_info}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 *Portfolio:*\n"
+        f"💰 Available: ₹{portfolio['available']:,.0f}\n"
+        f"📂 Open Positions: {len(portfolio['positions'])}\n"
+        f"🔢 Aaj ke Trades: {portfolio['trades_today']}/{MAX_TRADES_PER_DAY}\n"
+        f"🕐 Last Scan: {portfolio.get('last_scan_time', 'N/A')}\n\n"
+        f"🌍 *Market Bias:* {market_bias['direction']}\n"
+        f"_{market_bias.get('reason', 'N/A')}_"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Full news scan shuru...")
     await run_scan(silent=False)
+
 
 async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📰 Latest news fetch ho rahi hai...")
@@ -1022,6 +1289,7 @@ async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  • _{a['headline'][:100]}_")
     await update.message.reply_text("\n".join(lines[:60]), parse_mode="Markdown")
 
+
 async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pos = portfolio["positions"]
     if not pos:
@@ -1031,6 +1299,7 @@ async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for sym, p in pos.items():
         lines.append(f"▪️ *{p['name']}* {p['qty']} shares @ ₹{p['entry']:,.2f}\n   SL: ₹{p['sl']:,.2f} | T: ₹{p['target']:,.2f}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 
 async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     closed    = portfolio["closed_trades"]
@@ -1042,13 +1311,11 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     net_worth = portfolio["available"] + sum(p["cost"] for p in open_pos.values())
     overall_pnl_pct = round((net_worth - PAPER_CAPITAL) / PAPER_CAPITAL * 100, 2)
 
-    # Get live prices for open positions
     price_data = {}
     if open_pos:
-        syms = list(set(p.get("symbol", k.split("_")[0]) for k, p in open_pos.items()))
+        syms       = list(set(p.get("symbol", k.split("_")[0]) for k, p in open_pos.items()))
         price_data = await get_price_data(syms)
 
-    # ━━━ Message 1: Overall Summary ━━━
     msg1 = (
         f"📊 *FULL TRADING DASHBOARD*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1063,39 +1330,39 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🎯 Win Rate: {win_rate}%\n"
         f"📦 Total Trades: {len(closed)}\n"
         f"🔢 Aaj ke trades: {portfolio['trades_today']}/{MAX_TRADES_PER_DAY}\n"
+        f"\n🔌 {angel.status_text()}"
     )
     await update.message.reply_text(msg1, parse_mode="Markdown")
 
-    # ━━━ Message 2: Open Positions ━━━
     if open_pos:
         lines = ["📂 *OPEN POSITIONS:*\n━━━━━━━━━━━━━━━━━━"]
         for pos_key, pos in open_pos.items():
-            sym  = pos.get("symbol", pos_key.split("_")[0])
-            curr = price_data.get(sym, {}).get("price", pos["entry"])
+            sym    = pos.get("symbol", pos_key.split("_")[0])
+            curr   = price_data.get(sym, {}).get("price", pos["entry"])
             is_buy = pos["direction"] == "BUY"
-            live_pnl = (curr - pos["entry"]) * pos["qty"] if is_buy else (pos["entry"] - curr) * pos["qty"]
+            live_pnl     = (curr - pos["entry"]) * pos["qty"] if is_buy else (pos["entry"] - curr) * pos["qty"]
             live_pnl_pct = round(live_pnl / pos["cost"] * 100, 2)
-            total_move = abs(pos["target"] - pos["entry"])
-            curr_move  = abs(curr - pos["entry"]) if (is_buy and curr > pos["entry"]) or (not is_buy and curr < pos["entry"]) else 0
-            progress   = round(curr_move / total_move * 100) if total_move > 0 else 0
+            total_move   = abs(pos["target"] - pos["entry"])
+            curr_move    = abs(curr - pos["entry"]) if (is_buy and curr > pos["entry"]) or (not is_buy and curr < pos["entry"]) else 0
+            progress     = round(curr_move / total_move * 100) if total_move > 0 else 0
 
-            # Progress bar
             bars     = int(progress / 10)
             prog_bar = "🟢" * bars + "⬜" * (10 - bars)
 
-            # Days open calculation
             open_date = pos.get("open_date")
             if open_date:
-                days_open = (datetime.datetime.now() - datetime.datetime.fromisoformat(open_date)).days
+                days_open  = (datetime.datetime.now() - datetime.datetime.fromisoformat(open_date)).days
                 hours_open = int((datetime.datetime.now() - datetime.datetime.fromisoformat(open_date)).seconds / 3600)
-                time_str = f"{days_open} din {hours_open} ghante" if days_open > 0 else f"{hours_open} ghante"
+                time_str   = f"{days_open} din {hours_open} ghante" if days_open > 0 else f"{hours_open} ghante"
             else:
                 time_str = "N/A"
 
+            # Price source tag
+            src = price_data.get(sym, {}).get("source", "?")
             lines.append(
                 f"\n{'📈' if is_buy else '📉'} *{pos['name']}*\n"
                 f"🕐 Open: {pos.get('open_time', 'N/A')} ({time_str} se)\n"
-                f"Entry: ₹{pos['entry']:,.2f} | Now: ₹{curr:,.2f}\n"
+                f"Entry: ₹{pos['entry']:,.2f} | Now: ₹{curr:,.2f} _[{src}]_\n"
                 f"SL: ₹{pos['sl']:,.2f} | Target: ₹{pos['target']:,.2f}\n"
                 f"P&L: {'+'if live_pnl>=0 else ''}₹{live_pnl:,.0f} ({'+' if live_pnl_pct>=0 else ''}{live_pnl_pct}%)\n"
                 f"Progress: {prog_bar} {progress}%\n"
@@ -1105,7 +1372,6 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("📭 *Koi open position nahi hai abhi*", parse_mode="Markdown")
 
-    # ━━━ Message 3: Closed Trades History ━━━
     if closed:
         lines = ["📜 *CLOSED TRADES HISTORY:*\n━━━━━━━━━━━━━━━━━━"]
         for i, t in enumerate(closed[-10:], 1):
@@ -1123,6 +1389,7 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("📭 *Abhi tak koi trade close nahi hua*", parse_mode="Markdown")
 
+
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Help*\n━━━━━━━━━━━━━━━━\n"
@@ -1139,7 +1406,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/scan — Abhi scan\n"
         "/news — Latest headlines\n"
         "/portfolio — Open positions\n"
-        "/summary — P&L",
+        "/summary — P&L dashboard\n"
+        "/status — Angel One + agent status",
         parse_mode="Markdown"
     )
 
@@ -1157,7 +1425,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "YES":
-        # Daily limit check
         if not can_trade():
             await update.message.reply_text(
                 f"⛔ Aaj ke {MAX_TRADES_PER_DAY} trades ho gaye!\n"
@@ -1165,7 +1432,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Check agar is user ne already yeh trade liya hai
         trade_key = f"{signal['symbol']}_{user_id}"
         if trade_key in portfolio.get("user_trades", set()):
             await update.message.reply_text("⚠️ Tune yeh trade already le liya hai!")
@@ -1195,7 +1461,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "open_time": datetime.datetime.now().strftime("%d %b %Y, %I:%M %p"),
             "open_date": datetime.datetime.now().isoformat(),
         }
-        # Track user trades
         if "user_trades" not in portfolio:
             portfolio["user_trades"] = set()
         portfolio["user_trades"].add(trade_key)
@@ -1203,7 +1468,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         portfolio["trades_today"] += 1
         left = trades_left()
 
-        # Sirf us user ko confirm bhejo
         bot: Bot = bot_app.bot
         try:
             await bot.send_message(
@@ -1222,7 +1486,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Confirm msg failed: {e}")
 
-        # Dono ko batao ki kisne trade liya
         user_name = update.effective_user.first_name or "Someone"
         await send_to_all(
             f"📊 *{user_name} ne trade liya!*\n"
@@ -1231,7 +1494,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"_Doosra bhi YES bhej sakta hai apna trade lene ke liye!_"
         )
 
-        # Summary bhejo
         closed    = portfolio["closed_trades"]
         total_pnl = sum(t["pnl"] for t in closed)
         wins      = portfolio["win_count"]
@@ -1251,7 +1513,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     elif text == "NO":
-        # Sirf uss user ke liye skip — dusre ke liye pending raha
         user_name = update.effective_user.first_name or "Someone"
         bot: Bot = bot_app.bot
         try:
@@ -1275,9 +1536,25 @@ async def main():
     if missing:
         raise ValueError(f"Missing env vars: {missing}")
 
+    # ── Angel One startup login ──────────────────────────────────────
+    logger.info("🔌 Angel One SmartAPI se connect ho raha hoon...")
+    angel_ok = await angel.login()
+    if angel_ok:
+        logger.info("✅ Angel One connected — Live prices milenge!")
+    else:
+        logger.warning("⚠️  Angel One login failed — NSE fallback use hoga")
+
+    # ── Telegram bot setup ───────────────────────────────────────────
     bot_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    for cmd, fn in [("start",cmd_start),("scan",cmd_scan),("news",cmd_news),
-                    ("portfolio",cmd_portfolio),("summary",cmd_summary),("help",cmd_help)]:
+    for cmd, fn in [
+        ("start",     cmd_start),
+        ("status",    cmd_status),
+        ("scan",      cmd_scan),
+        ("news",      cmd_news),
+        ("portfolio", cmd_portfolio),
+        ("summary",   cmd_summary),
+        ("help",      cmd_help),
+    ]:
         bot_app.add_handler(CommandHandler(cmd, fn))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
@@ -1285,19 +1562,27 @@ async def main():
     await bot_app.start()
     await bot_app.updater.start_polling(drop_pending_updates=True)
 
+    # ── Startup message ──────────────────────────────────────────────
+    angel_line = (
+        "🔌 Angel One: ✅ Connected — Live prices ON!"
+        if angel_ok else
+        "🔌 Angel One: ⚠️ Fallback mode (NSE scraping)"
+    )
     await send_to_all(
         f"🟢 *NSE News Intelligence Agent Online!*\n"
         f"💼 Capital: ₹{PAPER_CAPITAL:,.0f}\n"
         f"📰 {len(NEWS_FEEDS)} news sources monitor ho rahi hain\n"
         f"📊 {len(STOCKS)} NSE stocks track ho rahe hain\n"
-        f"🔍 Scan: Har {SCAN_INTERVAL_MIN} min\n\n"
+        f"🔍 Scan: Har {SCAN_INTERVAL_MIN} min\n"
+        f"{angel_line}\n\n"
         "Pehla scan 30 sec mein! 🚀\n"
-        "/news dabao abhi ki headlines ke liye"
+        "/status dabao Angel One check karne ke liye"
     )
 
     asyncio.create_task(scan_loop())
-    asyncio.create_task(position_monitor_loop())  # Har 5 min position check
+    asyncio.create_task(position_monitor_loop())
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

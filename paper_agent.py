@@ -999,20 +999,27 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
                 good_arts = [a for a in stock_arts if any(kw in a["headline"].lower() for kw in good_news_keywords)]
                 bad_arts  = [a for a in stock_arts if any(kw in a["headline"].lower() for kw in bad_news_keywords)]
 
-                news_msg  = f"📰 *{name} — Latest News Update:*\n━━━━━━━━━━━━━━━━━━\n"
-                news_msg += f"Current: ₹{curr:,.2f} | P&L: {'+'if pnl>=0 else ''}₹{pnl:,.0f} ({pnl_pct:+.1f}%)\n"
-                news_msg += f"Target Progress: {tgt_progress}%\n\n"
-                if good_arts:
-                    news_msg += "✅ *Good News:*\n"
-                    for a in good_arts[:3]:
-                        news_msg += f"  • _{a['headline'][:100]}_\n"
-                if bad_arts:
-                    news_msg += "\n⚠️ *Bad News:*\n"
-                    for a in bad_arts[:3]:
-                        news_msg += f"  • _{a['headline'][:100]}_\n"
-                if not good_arts and not bad_arts:
-                    news_msg += "📭 Koi specific news nahi abhi"
-                await _send_to_user(user_id, news_msg)
+                # Spam fix — sirf naya news bhejo, same news baar baar nahi
+                last_sent = pos.get("last_news_headlines", set())
+                new_good  = [a for a in good_arts if a["headline"] not in last_sent]
+                new_bad   = [a for a in bad_arts  if a["headline"] not in last_sent]
+
+                if new_good or new_bad:
+                    news_msg  = f"📰 *{name} — News Update:*\n━━━━━━━━━━━━━━━━━━\n"
+                    news_msg += f"Current: ₹{curr:,.2f} | P&L: {'+'if pnl>=0 else ''}₹{pnl:,.0f} ({pnl_pct:+.1f}%)\n"
+                    news_msg += f"Target Progress: {tgt_progress}%\n\n"
+                    if new_good:
+                        news_msg += "✅ *Good News:*\n"
+                        for a in new_good[:3]:
+                            news_msg += f"  • _{a['headline'][:100]}_\n"
+                    if new_bad:
+                        news_msg += "\n⚠️ *Bad News:*\n"
+                        for a in new_bad[:3]:
+                            news_msg += f"  • _{a['headline'][:100]}_\n"
+                    await _send_to_user(user_id, news_msg)
+
+                    # Update seen headlines
+                    pos["last_news_headlines"] = last_sent | {a["headline"] for a in good_arts+bad_arts}
 
             if tgt_progress >= 80 and has_bad_news:
                 msg = (
@@ -1198,6 +1205,102 @@ async def position_monitor_loop():
         except Exception as e:
             logger.error(f"Position monitor error: {e}")
         await asyncio.sleep(5 * 60)
+
+
+async def send_daily_report():
+    """3:30 PM pe automatic Daily P&L Report — dono ko"""
+    IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    now = datetime.datetime.now(IST)
+
+    closed    = portfolio["closed_trades"]
+    open_pos  = portfolio["positions"]
+    net_worth = portfolio["available"] + sum(p["cost"] for p in open_pos.values())
+    total_pnl = sum(t["pnl"] for t in closed)
+    overall_pnl_pct = round((net_worth - PAPER_CAPITAL) / PAPER_CAPITAL * 100, 2)
+
+    today_str    = now.strftime("%d %b %Y")
+    today_trades = [t for t in closed if today_str in t.get("time", "")]
+    today_pnl    = sum(t["pnl"] for t in today_trades)
+    today_wins   = sum(1 for t in today_trades if t["pnl"] > 0)
+    today_losses = len(today_trades) - today_wins
+
+    open_pnl   = 0
+    price_data = {}
+    if open_pos:
+        syms       = list(set(p.get("symbol", k.split("_")[0]) for k, p in open_pos.items()))
+        price_data = await get_price_data(syms)
+        for pos_key, pos in open_pos.items():
+            sym    = pos.get("symbol", pos_key.split("_")[0])
+            curr   = price_data.get(sym, {}).get("price", pos["entry"])
+            is_buy = pos["direction"] == "BUY"
+            open_pnl += (curr - pos["entry"]) * pos["qty"] if is_buy else (pos["entry"] - curr) * pos["qty"]
+
+    wins         = portfolio["win_count"]
+    total_closed = len(closed)
+    win_rate     = round(wins / total_closed * 100, 1) if total_closed else 0
+    day_emo      = "🎉" if today_pnl > 0 else ("😐" if today_pnl == 0 else "😔")
+    tot_emo      = "🚀" if total_pnl > 0 else ("😐" if total_pnl == 0 else "📉")
+
+    msg = (
+        f"🌅 *AAJ KA REPORT — {today_str}* {day_emo}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📅 *Aaj ka P&L:*\n"
+        f"{'✅' if today_pnl >= 0 else '❌'} Closed trades: {'+'if today_pnl>=0 else ''}₹{today_pnl:,.0f}\n"
+        f"📂 Open positions P&L: {'+'if open_pnl>=0 else ''}₹{open_pnl:,.0f}\n"
+        f"🏆 Aaj ke trades: {len(today_trades)} (✅{today_wins} ❌{today_losses})\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{tot_emo} *Overall Performance:*\n"
+        f"💰 Capital: ₹{PAPER_CAPITAL:,.0f}\n"
+        f"💼 Net Worth: ₹{net_worth:,.0f}\n"
+        f"{'📈' if total_pnl>=0 else '📉'} Total P&L: {'+'if total_pnl>=0 else ''}₹{total_pnl:,.0f} ({'+' if overall_pnl_pct>=0 else ''}{overall_pnl_pct}%)\n"
+        f"🎯 Win Rate: {win_rate}% ({wins}W/{total_closed-wins}L)\n\n"
+    )
+
+    if open_pos:
+        msg += f"📂 *Open Positions (carry forward):*\n"
+        for pos_key, pos in open_pos.items():
+            sym      = pos.get("symbol", pos_key.split("_")[0])
+            curr     = price_data.get(sym, {}).get("price", pos["entry"])
+            is_buy   = pos["direction"] == "BUY"
+            live_pnl = (curr - pos["entry"]) * pos["qty"] if is_buy else (pos["entry"] - curr) * pos["qty"]
+            live_pct = round(live_pnl / pos["cost"] * 100, 2)
+            total_move = abs(pos["target"] - pos["entry"])
+            curr_move  = abs(curr - pos["entry"]) if (is_buy and curr > pos["entry"]) or (not is_buy and curr < pos["entry"]) else 0
+            progress   = round(curr_move / total_move * 100) if total_move > 0 else 0
+            msg += (
+                f"{'📈' if is_buy else '📉'} *{pos['name']}*\n"
+                f"   Entry: ₹{pos['entry']:,.2f} | Now: ₹{curr:,.2f}\n"
+                f"   P&L: {'+'if live_pnl>=0 else ''}₹{live_pnl:,.0f} ({'+' if live_pct>=0 else ''}{live_pct}%)\n"
+                f"   Progress: {progress}% | SL: ₹{pos['sl']:,.2f} | T: ₹{pos['target']:,.2f}\n\n"
+            )
+
+    if today_trades:
+        msg += f"📜 *Aaj ke Closed Trades:*\n"
+        for t in today_trades:
+            emo = "✅" if t["pnl"] >= 0 else "❌"
+            msg += f"{emo} {t['sym'].split('_')[0]}: {'+'if t['pnl']>=0 else ''}₹{t['pnl']:,.0f}\n"
+
+    msg += f"\n_Market kal 9:15 AM pe khulega. Good night! 🌙_"
+    await send_to_all(msg)
+    logger.info("📊 Daily report sent!")
+
+
+async def daily_report_loop():
+    """Roz 3:30 PM IST pe daily report — market close ke baad"""
+    IST           = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    reported_today = None
+    await asyncio.sleep(120)
+    while True:
+        try:
+            now   = datetime.datetime.now(IST)
+            today = now.date()
+            market_close_time = now.replace(hour=15, minute=31, second=0, microsecond=0)
+            if now >= market_close_time and now.weekday() < 5 and reported_today != today:
+                reported_today = today
+                await send_daily_report()
+        except Exception as e:
+            logger.error(f"Daily report error: {e}")
+        await asyncio.sleep(60)
 
 
 async def scan_loop():
@@ -1581,6 +1684,7 @@ async def main():
 
     asyncio.create_task(scan_loop())
     asyncio.create_task(position_monitor_loop())
+    asyncio.create_task(daily_report_loop())
     await asyncio.Event().wait()
 
 

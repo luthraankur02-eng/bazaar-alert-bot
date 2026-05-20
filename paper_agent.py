@@ -1132,17 +1132,32 @@ async def run_scan(silent: bool = False):
             await asyncio.sleep(1)
     else:
         if price_data:
-            best = max(
-                [(s,d) for s,d in price_data.items() if s in STOCKS],
+            # Aaj jo stocks already suggest ho chuke hain unhe skip karo
+            today_str = datetime.date.today().isoformat()
+            if portfolio.get("signals_date") != today_str:
+                portfolio["signals_date"]    = today_str
+                portfolio["signals_today"]   = set()
+
+            already_suggested = portfolio.get("signals_today", set())
+
+            # Top 5 movers lo — already suggested ko skip karo
+            sorted_stocks = sorted(
+                [(s, d) for s, d in price_data.items()
+                 if s in STOCKS and s not in already_suggested],
                 key=lambda x: x[1]["volume_ratio"],
-                default=None
+                reverse=True
             )
-            if best:
-                sym, d    = best
+
+            if sorted_stocks:
+                sym, d    = sorted_stocks[0]
                 direction = "BUY" if d["change_pct"] >= 0 else "SELL"
                 entry     = d["price"]
                 sl        = round(entry * 0.965, 2) if direction == "BUY" else round(entry * 1.035, 2)
                 target    = round(entry * 1.105, 2) if direction == "BUY" else round(entry * 0.895, 2)
+
+                # Is stock ko aaj ke liye mark karo
+                portfolio["signals_today"].add(sym)
+
                 fallback_signal = {
                     "found_signal":         True,
                     "global_market":        "NEUTRAL",
@@ -1167,7 +1182,10 @@ async def run_scan(silent: bool = False):
                     ],
                     "impact_reason":        "Volume spike + price momentum — technical setup",
                     "risk_factors":         "News-based catalyst nahi — pure technical trade",
-                    "other_stocks_impacted":[]
+                    "other_stocks_impacted": [
+                        s for s, _ in sorted_stocks[1:4]
+                        if s in STOCKS
+                    ]
                 }
                 portfolio["pending_signal"] = fallback_signal
                 msgs = format_alert(fallback_signal, [])

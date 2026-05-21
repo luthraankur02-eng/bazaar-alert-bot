@@ -145,7 +145,9 @@ STOCKS = {
     "IRFC.NS":       {"name": "IRFC",                 "aliases": ["irfc","indian railway finance"],                    "sector": "Finance"},
 }
 
-# Commodity price news → affected stocks
+# Blacklist — in stocks ko fallback signal mein mat lo (Angel One data unreliable)
+SIGNAL_BLACKLIST = {"ADANIGREEN.NS"}
+
 COMMODITY_IMPACT = {
     "steel":       ["TATASTEEL.NS","JSWSTEEL.NS","SAIL.NS"],
     "iron ore":    ["TATASTEEL.NS","JSWSTEEL.NS","SAIL.NS","NMDC.NS"],
@@ -1142,23 +1144,22 @@ async def run_scan(silent: bool = False):
 
             # Open positions ke stocks bhi skip karo
             open_syms = set(p.get("symbol","") for p in portfolio["positions"].values())
-            skip_syms = already_suggested | open_syms
+            skip_syms = already_suggested | open_syms | SIGNAL_BLACKLIST
 
-            # Top movers lo — skip karo already suggested + open positions
+            # Abs change_pct se sort karo — volume_ratio unreliable hai Angel One mein
             sorted_stocks = sorted(
                 [(s, d) for s, d in price_data.items()
-                 if s in STOCKS and s not in skip_syms],
-                key=lambda x: x[1]["volume_ratio"],
+                 if s in STOCKS and s not in skip_syms and d.get("price", 0) > 0],
+                key=lambda x: abs(x[1].get("change_pct", 0)),
                 reverse=True
             )
 
             if not sorted_stocks:
-                # Sab suggest ho gaye — skip_syms reset karo sirf open positions rakhke
                 portfolio["signals_today"] = set()
                 sorted_stocks = sorted(
                     [(s, d) for s, d in price_data.items()
-                     if s in STOCKS and s not in open_syms],
-                    key=lambda x: x[1]["volume_ratio"],
+                     if s in STOCKS and s not in open_syms and s not in SIGNAL_BLACKLIST],
+                    key=lambda x: abs(x[1].get("change_pct", 0)),
                     reverse=True
                 )
 

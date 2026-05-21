@@ -1135,18 +1135,32 @@ async def run_scan(silent: bool = False):
             # Aaj jo stocks already suggest ho chuke hain unhe skip karo
             today_str = datetime.date.today().isoformat()
             if portfolio.get("signals_date") != today_str:
-                portfolio["signals_date"]    = today_str
-                portfolio["signals_today"]   = set()
+                portfolio["signals_date"]  = today_str
+                portfolio["signals_today"] = set()
 
             already_suggested = portfolio.get("signals_today", set())
 
-            # Top 5 movers lo — already suggested ko skip karo
+            # Open positions ke stocks bhi skip karo
+            open_syms = set(p.get("symbol","") for p in portfolio["positions"].values())
+            skip_syms = already_suggested | open_syms
+
+            # Top movers lo — skip karo already suggested + open positions
             sorted_stocks = sorted(
                 [(s, d) for s, d in price_data.items()
-                 if s in STOCKS and s not in already_suggested],
+                 if s in STOCKS and s not in skip_syms],
                 key=lambda x: x[1]["volume_ratio"],
                 reverse=True
             )
+
+            if not sorted_stocks:
+                # Sab suggest ho gaye — skip_syms reset karo sirf open positions rakhke
+                portfolio["signals_today"] = set()
+                sorted_stocks = sorted(
+                    [(s, d) for s, d in price_data.items()
+                     if s in STOCKS and s not in open_syms],
+                    key=lambda x: x[1]["volume_ratio"],
+                    reverse=True
+                )
 
             if sorted_stocks:
                 sym, d    = sorted_stocks[0]
@@ -1159,33 +1173,30 @@ async def run_scan(silent: bool = False):
                 portfolio["signals_today"].add(sym)
 
                 fallback_signal = {
-                    "found_signal":         True,
-                    "global_market":        "NEUTRAL",
-                    "global_reason":        "Price action based signal",
-                    "symbol":               sym,
-                    "name":                 STOCKS[sym]["name"],
-                    "sector":               STOCKS[sym]["sector"],
-                    "direction":            direction,
-                    "news_type":            "TECHNICAL_BREAKOUT",
-                    "news_type_hindi":      f"Volume spike {d['volume_ratio']}x — Price action trade",
-                    "entry":                entry,
-                    "stop_loss":            sl,
-                    "target":               target,
-                    "risk_reward":          "1:3",
-                    "confidence_pct":       60,
-                    "confidence":           "MEDIUM",
-                    "smc_setup":            f"Volume {d['volume_ratio']}x normal, {d['change_pct']:+.2f}% move",
-                    "key_news":             [
+                    "found_signal":          True,
+                    "global_market":         "NEUTRAL",
+                    "global_reason":         "Price action based signal",
+                    "symbol":                sym,
+                    "name":                  STOCKS[sym]["name"],
+                    "sector":                STOCKS[sym]["sector"],
+                    "direction":             direction,
+                    "news_type":             "TECHNICAL_BREAKOUT",
+                    "news_type_hindi":       f"Volume spike {d['volume_ratio']}x — Price action trade",
+                    "entry":                 entry,
+                    "stop_loss":             sl,
+                    "target":                target,
+                    "risk_reward":           "1:3",
+                    "confidence_pct":        60,
+                    "confidence":            "MEDIUM",
+                    "smc_setup":             f"Volume {d['volume_ratio']}x normal, {d['change_pct']:+.2f}% move",
+                    "key_news":              [
                         f"{STOCKS[sym]['name']} mein unusual volume activity",
                         f"Price {d['change_pct']:+.2f}% move aaj",
                         f"Volume {d['volume_ratio']}x normal se zyada"
                     ],
-                    "impact_reason":        "Volume spike + price momentum — technical setup",
-                    "risk_factors":         "News-based catalyst nahi — pure technical trade",
-                    "other_stocks_impacted": [
-                        s for s, _ in sorted_stocks[1:4]
-                        if s in STOCKS
-                    ]
+                    "impact_reason":         "Volume spike + price momentum — technical setup",
+                    "risk_factors":          "News-based catalyst nahi — pure technical trade",
+                    "other_stocks_impacted": [s for s, _ in sorted_stocks[1:4] if s in STOCKS]
                 }
                 portfolio["pending_signal"] = fallback_signal
                 msgs = format_alert(fallback_signal, [])
@@ -1328,8 +1339,9 @@ async def scan_loop():
             if await is_market_open():
                 await run_scan()
             else:
-                now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30)))
-                logger.info(f"Market band hai — {now.strftime('%I:%M %p')} IST")
+                IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+                now = datetime.datetime.now(IST)
+                logger.info(f"Market band hai — {now.strftime('%I:%M %p')} IST | Next open: 9:15 AM")
         except Exception as e:
             logger.error(f"Scan error: {e}")
         await asyncio.sleep(SCAN_INTERVAL_MIN * 60)

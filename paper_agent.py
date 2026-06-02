@@ -1560,7 +1560,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def main():
     global bot_app
-    missing = [k for k in ["TELEGRAM_BOT_TOKEN","ANTHROPIC_API_KEY","MY_CHAT_ID"] if not os.environ.get(k)]
+    missing = [k for k in ["TELEGRAM_BOT_TOKEN", "MY_CHAT_ID", "GROQ_API_KEY"] if not os.environ.get(k)]
     if missing:
         raise ValueError(f"Missing env vars: {missing}")
 

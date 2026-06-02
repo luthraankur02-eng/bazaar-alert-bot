@@ -25,7 +25,7 @@ Price Source:
 import os, json, asyncio, logging, datetime, re
 import httpx, feedparser
 import pyotp
-from anthropic import AsyncAnthropic
+from groq import AsyncGroq
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -37,11 +37,12 @@ market_bias = {"direction": "NEUTRAL", "reason": "", "updated": None}
 # ══════════════════════════════════════════════════════════════════════
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
 MY_CHAT_ID         = os.environ.get("MY_CHAT_ID", "")
 COUSIN_CHAT_ID     = os.environ.get("COUSIN_CHAT_ID", "")
-SCAN_INTERVAL_MIN  = int(os.environ.get("SCAN_INTERVAL_MIN", "30"))
+SCAN_INTERVAL_MIN  = int(os.environ.get("SCAN_INTERVAL_MIN", "60"))
 PAPER_CAPITAL      = 20000.0
+MAX_OPEN_POSITIONS = 2   # Max 2 open positions at a time
 
 # ── Angel One SmartAPI config ──────────────────────────────────────
 ANGEL_API_KEY    = os.environ.get("ANGEL_API_KEY", "")
@@ -260,16 +261,17 @@ def reset_daily_limit():
 
 def can_trade() -> bool:
     reset_daily_limit()
-    return portfolio["trades_today"] < MAX_TRADES_PER_DAY
+    open_count = len(portfolio["positions"])
+    return portfolio["trades_today"] < MAX_TRADES_PER_DAY and open_count < MAX_OPEN_POSITIONS
 
 def trades_left() -> int:
     reset_daily_limit()
     return MAX_TRADES_PER_DAY - portfolio["trades_today"]
 
-claude  = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger  = logging.getLogger(__name__)
-bot_app = None
+logger      = logging.getLogger(__name__)
+bot_app     = None
 
 # ══════════════════════════════════════════════════════════════════════
 # 🔌 ANGEL ONE SESSION MANAGER
@@ -717,71 +719,30 @@ async def ai_analyze_news(articles: list[dict], stock_news: dict, price_data: di
             for sym, d in sorted_by_move[:15] if sym in STOCKS
         ])
 
-    prompt = f"""Tu ek expert NSE intraday trader hai jo Smart Money Concept (SMC) follow karta hai.
+    prompt = f"""Tu ek expert NSE swing trader hai. Sirf tab trade suggest karo jab STRONG news catalyst ho.
 
-━━━━━━━━ STEP 1: GLOBAL MARKET CHECK ━━━━━━━━
-News mein dekh: US markets (Dow, S&P, Nasdaq), SGX Nifty, Asian markets kaisa hai?
-- Global markets UP → India bullish → sirf BUY trades
-- Global markets DOWN → India bearish → sirf SELL trades
-- Mixed → strong individual stock news dekh
+RULES:
+- Sirf tab trade do jab strong news ho (order, result, merger, FII, policy, RBI)
+- Pure price movement pe trade MAT do — found_signal: false karo
+- BUY: global bullish + positive news catalyst
+- SELL: global bearish + negative news catalyst
+- SL: 3.5% | Target: 10.5% | R:R 1:3
+- Large cap stocks only
 
-━━━━━━━━ SAARI MARKET NEWS ━━━━━━━━
+MARKET NEWS:
 {all_news_text}
 
-━━━━━━━━ STOCKS IN NEWS ━━━━━━━━
-{stock_news_text if stock_news_text else "General market news se analyze karo"}
+STOCKS IN NEWS:
+{stock_news_text if stock_news_text else "Koi specific stock news nahi"}
 
-━━━━━━━━ TOP MOVERS (Price + Volume) ━━━━━━━━
+TOP MOVERS:
 {movers_text if movers_text else "Price data unavailable"}
 
-━━━━━━━━ SMC ANALYSIS FRAMEWORK ━━━━━━━━
-Har stock ke liye mentally yeh check karo:
-
-📦 FAIR VALUE GAP (FVG):
-- 3 candle pattern — middle candle badi move karti hai, gap rehta hai
-- Price FVG fill karne aata hai → entry opportunity
-- Bullish FVG: price neeche aake FVG fill kare → BUY
-- Bearish FVG: price upar aake FVG fill kare → SELL
-- News + FVG = strong confluence
-
-🏗️ BREAK OF STRUCTURE (BOS):
-- Higher High + Higher Low = Bullish BOS → BUY trend confirm
-- Lower Low + Lower High = Bearish BOS → SELL trend confirm
-- BOS ke baad retest pe entry lo
-- Strong volume ke saath BOS = institutional confirmation
-
-━━━━━━━━ TRADING STYLE ━━━━━━━━
-SWING TRADING — 2-3 din hold karo
-
-Rules:
-- SL: 3-4% (thoda zyada room do)
-- Target: 9-12% (3x SL = 1:3 R:R)
-- Hold time: 2-3 trading days
-- Entry: Current price pe ya thodi pullback pe
-- Large cap stocks prefer karo — easily exit mil jaye
-- News catalyst strong hona chahiye — 2-3 din tak effect rahega
-
-━━━━━━━━ TERI TASK ━━━━━━━━
-1. Global market mood check karo
-2. TOP liquid sectors: IT | Pharma | Defence | Banking | FMCG | Energy | Auto | Cement
-3. Stock selection:
-   ✅ Large cap, high liquidity
-   ✅ Volume spike (vol_ratio > 1.2x) = institutional activity
-   ✅ News catalyst + SMC setup = strong trade
-   ✅ FVG ya BOS confluence ho toh extra confidence
-4. Market bullish → SIRF BUY | Bearish → SIRF SELL
-5. HAMESHA ek trade do — news na ho toh price action + SMC se decide karo
-6. SL: FVG ke neeche ya BOS level | Target: next FVG ya structure level
-7. Min R:R 1:3 — SL 3-4%, Target 9-12% (2-3 din swing)
-
-News type:
-ORDER_WIN | QUARTERLY_RESULT | MERGER_ACQUISITION | COMMODITY_IMPACT | POLICY_CHANGE | FII_DII | MANAGEMENT_CHANGE | GLOBAL_IMPACT | TECHNICAL_BREAKOUT | SECTOR_ROTATION | SMC_SETUP
-
-Respond ONLY in JSON:
+Respond ONLY in JSON (no markdown):
 {{
   "found_signal": true,
   "global_market": "BULLISH",
-  "global_reason": "SGX Nifty +0.5%, US markets green",
+  "global_reason": "SGX Nifty green",
   "symbol": "HDFCBANK.NS",
   "name": "HDFC Bank",
   "sector": "Banking",
@@ -789,29 +750,30 @@ Respond ONLY in JSON:
   "news_type": "FII_DII",
   "news_type_hindi": "FII ne banking mein buying ki",
   "entry": 1750.00,
-  "stop_loss": 1724.00,
-  "target": 1811.00,
-  "risk_reward": "1:2.3",
+  "stop_loss": 1688.75,
+  "target": 1933.75,
+  "risk_reward": "1:3",
   "confidence_pct": 78,
   "confidence": "HIGH",
-  "smc_setup": "Bullish FVG at 1748-1752 + BOS confirmed above 1760",
-  "key_news": [
-    "FII ne ₹3200 Cr ki net buying ki",
-    "HDFC Bank volume 2x normal",
-    "Banking sector mein momentum"
-  ],
-  "impact_reason": "FVG fill + BOS confirm + FII buying — strong institutional BUY setup",
-  "risk_factors": "RBI surprise ya global selloff",
-  "other_stocks_impacted": ["ICICIBANK.NS", "SBIN.NS"]
+  "smc_setup": "Strong news catalyst + volume confirmation",
+  "key_news": ["FII ne ₹3200 Cr buying ki", "Volume 2x normal"],
+  "impact_reason": "Strong news catalyst based trade",
+  "risk_factors": "Global selloff",
+  "other_stocks_impacted": ["ICICIBANK.NS"]
 }}"""
 
     try:
-        resp = await claude.messages.create(
-            model="claude-sonnet-4-20250514",
+        resp = await groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             max_tokens=800,
-            messages=[{"role": "user", "content": prompt}]
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": "You are an expert NSE swing trader. Respond in valid JSON only. No markdown, no explanation."},
+                {"role": "user", "content": prompt}
+            ]
         )
-        raw  = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
+        raw  = resp.choices[0].message.content.strip()
+        raw  = raw.replace("```json","").replace("```","").strip()
         data = json.loads(raw)
         if data.get("global_market"):
             market_bias["direction"] = data["global_market"]
@@ -819,7 +781,7 @@ Respond ONLY in JSON:
             market_bias["updated"]   = datetime.datetime.now().strftime("%I:%M %p")
         return data if data.get("found_signal") else data
     except Exception as e:
-        logger.error(f"AI error: {e}")
+        logger.error(f"Groq AI error: {e}")
         return None
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1133,85 +1095,17 @@ async def run_scan(silent: bool = False):
             await send_to_all(msg)
             await asyncio.sleep(1)
     else:
-        if price_data:
-            # Aaj jo stocks already suggest ho chuke hain unhe skip karo
-            today_str = datetime.date.today().isoformat()
-            if portfolio.get("signals_date") != today_str:
-                portfolio["signals_date"]  = today_str
-                portfolio["signals_today"] = set()
-
-            already_suggested = portfolio.get("signals_today", set())
-
-            # Open positions ke stocks bhi skip karo
-            open_syms = set(p.get("symbol","") for p in portfolio["positions"].values())
-            skip_syms = already_suggested | open_syms | SIGNAL_BLACKLIST
-
-            # Abs change_pct se sort karo — volume_ratio unreliable hai Angel One mein
-            sorted_stocks = sorted(
-                [(s, d) for s, d in price_data.items()
-                 if s in STOCKS and s not in skip_syms and d.get("price", 0) > 0],
-                key=lambda x: abs(x[1].get("change_pct", 0)),
-                reverse=True
-            )
-
-            if not sorted_stocks:
-                portfolio["signals_today"] = set()
-                sorted_stocks = sorted(
-                    [(s, d) for s, d in price_data.items()
-                     if s in STOCKS and s not in open_syms and s not in SIGNAL_BLACKLIST],
-                    key=lambda x: abs(x[1].get("change_pct", 0)),
-                    reverse=True
-                )
-
-            if sorted_stocks:
-                sym, d    = sorted_stocks[0]
-                direction = "BUY" if d["change_pct"] >= 0 else "SELL"
-                entry     = d["price"]
-                sl        = round(entry * 0.965, 2) if direction == "BUY" else round(entry * 1.035, 2)
-                target    = round(entry * 1.105, 2) if direction == "BUY" else round(entry * 0.895, 2)
-
-                # Is stock ko aaj ke liye mark karo
-                portfolio["signals_today"].add(sym)
-
-                fallback_signal = {
-                    "found_signal":          True,
-                    "global_market":         "NEUTRAL",
-                    "global_reason":         "Price action based signal",
-                    "symbol":                sym,
-                    "name":                  STOCKS[sym]["name"],
-                    "sector":                STOCKS[sym]["sector"],
-                    "direction":             direction,
-                    "news_type":             "TECHNICAL_BREAKOUT",
-                    "news_type_hindi":       f"Volume spike {d['volume_ratio']}x — Price action trade",
-                    "entry":                 entry,
-                    "stop_loss":             sl,
-                    "target":                target,
-                    "risk_reward":           "1:3",
-                    "confidence_pct":        60,
-                    "confidence":            "MEDIUM",
-                    "smc_setup":             f"Volume {d['volume_ratio']}x normal, {d['change_pct']:+.2f}% move",
-                    "key_news":              [
-                        f"{STOCKS[sym]['name']} mein unusual volume activity",
-                        f"Price {d['change_pct']:+.2f}% move aaj",
-                        f"Volume {d['volume_ratio']}x normal se zyada"
-                    ],
-                    "impact_reason":         "Volume spike + price momentum — technical setup",
-                    "risk_factors":          "News-based catalyst nahi — pure technical trade",
-                    "other_stocks_impacted": [s for s, _ in sorted_stocks[1:4] if s in STOCKS]
-                }
-                portfolio["pending_signal"] = fallback_signal
-                msgs = format_alert(fallback_signal, [])
-                for msg in msgs:
-                    await send_to_all(msg)
-                    await asyncio.sleep(1)
-                return
-
+        # Koi strong news signal nahi — koi trade nahi
+        open_count = len(portfolio["positions"])
         await send_to_all(
-            f"📭 *Scan complete*\n"
-            f"📰 {len(articles)} news articles analyze ki\n"
+            f"📭 *Scan complete — Koi strong signal nahi*\n"
+            f"📰 {len(articles)} news analyze ki\n"
             f"🔗 {len(stock_news)} stocks mention hue\n"
-            f"🔄 Agli scan {SCAN_INTERVAL_MIN} min mein"
+            f"📂 Open positions: {open_count}/{MAX_OPEN_POSITIONS}\n"
+            f"⏳ Agli scan {SCAN_INTERVAL_MIN} min mein\n"
+            f"_Sirf strong news pe trade hoga — patience rakho!_ 💪"
         )
+
 
 
 async def is_market_open() -> bool:
@@ -1708,9 +1602,11 @@ async def main():
         f"📰 {len(NEWS_FEEDS)} news sources monitor ho rahi hain\n"
         f"📊 {len(STOCKS)} NSE stocks track ho rahe hain\n"
         f"🔍 Scan: Har {SCAN_INTERVAL_MIN} min\n"
+        f"🤖 AI: Groq (Llama 3.3 70B) — FREE!\n"
+        f"📂 Max Open Positions: {MAX_OPEN_POSITIONS}\n"
+        f"⚡ Sirf strong news pe trade hoga!\n"
         f"{angel_line}\n\n"
-        "Pehla scan 30 sec mein! 🚀\n"
-        "/status dabao Angel One check karne ke liye"
+        "Pehla scan 30 sec mein! 🚀"
     )
 
     asyncio.create_task(scan_loop())

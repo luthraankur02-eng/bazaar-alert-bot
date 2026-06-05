@@ -258,6 +258,7 @@ def reset_daily_limit():
     if portfolio["today_date"] != today:
         portfolio["today_date"]   = today
         portfolio["trades_today"] = 0
+        portfolio["user_trades"]  = set()  # Har din reset — naya din fresh start!
 
 def can_trade() -> bool:
     reset_daily_limit()
@@ -1460,9 +1461,21 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Check 1: Kya is user ne pehle se yeh trade liya hai?
         trade_key = f"{signal['symbol']}_{user_id}"
         if trade_key in portfolio.get("user_trades", set()):
             await update.message.reply_text("⚠️ Tune yeh trade already le liya hai!")
+            return
+
+        # Check 2: Kya yeh stock already open position mein hai? (dono ke liye)
+        sym = signal["symbol"]
+        open_syms = [p.get("symbol","") for p in portfolio["positions"].values()]
+        if open_syms.count(sym) >= 1:
+            await update.message.reply_text(
+                f"⚠️ *{signal['name']}* already open position mein hai!\n"
+                f"Same stock dobara nahi le sakte. Agli signal ka wait karo.",
+                parse_mode="Markdown"
+            )
             return
 
         price = signal["entry"]

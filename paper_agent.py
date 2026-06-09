@@ -1,25 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║       📊 NSE PAPER TRADING AGENT — ₹20,000 Capital             ║
+║       📊 NSE PAPER TRADING AGENT — ₹50,000 Capital             ║
 ║   Full News Intelligence — Orders, Results, M&A, Commodities   ║
 ║   🔌 Angel One SmartAPI — Live Real-Time Prices                 ║
 ╚══════════════════════════════════════════════════════════════════╝
-
-Kya kya analyze karta hai:
-✅ Naye orders / contracts mile
-✅ Quarterly P&L results
-✅ Mergers, Acquisitions, Takeovers
-✅ Metal / Crude / Commodity prices → affected stocks
-✅ FII / DII buying or selling
-✅ Govt policy, Budget, RBI decisions
-✅ Regulatory news (SEBI, CCI)
-✅ Management changes, promoter activity
-✅ Global market impact on Indian stocks
-
-Price Source:
-🥇 Angel One SmartAPI — Real-time LTP + OHLC + Volume
-🥈 NSE Website Scraping — Fallback
-🥉 yfinance — Last resort
 """
 
 import os, json, asyncio, logging, datetime, re
@@ -41,17 +25,17 @@ GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
 MY_CHAT_ID         = os.environ.get("MY_CHAT_ID", "")
 COUSIN_CHAT_ID     = os.environ.get("COUSIN_CHAT_ID", "")
 SCAN_INTERVAL_MIN  = int(os.environ.get("SCAN_INTERVAL_MIN", "60"))
-PAPER_CAPITAL      = 20000.0
-MAX_OPEN_POSITIONS = 2   # Max 2 open positions at a time
+PAPER_CAPITAL      = 50000.0   # ✅ UPDATED: ₹50,000
+MAX_OPEN_POSITIONS = 2
 
 # ── Angel One SmartAPI config ──────────────────────────────────────
 ANGEL_API_KEY    = os.environ.get("ANGEL_API_KEY", "")
 ANGEL_CLIENT_ID  = os.environ.get("ANGEL_CLIENT_ID", "")
-ANGEL_SECRET_KEY = os.environ.get("ANGEL_SECRET_KEY", "")   # 4-digit PIN
-ANGEL_TOTP_KEY   = os.environ.get("ANGEL_TOTP_KEY", "")     # Base32 TOTP secret
+ANGEL_SECRET_KEY = os.environ.get("ANGEL_SECRET_KEY", "")
+ANGEL_TOTP_KEY   = os.environ.get("ANGEL_TOTP_KEY", "")
 
 # ══════════════════════════════════════════════════════════════════════
-# 📰 NEWS SOURCES — India ke sab bade financial news
+# 📰 NEWS SOURCES
 # ══════════════════════════════════════════════════════════════════════
 
 NEWS_FEEDS = [
@@ -76,7 +60,7 @@ NEWS_FEEDS = [
 ]
 
 # ══════════════════════════════════════════════════════════════════════
-# 📋 NSE STOCKS — aliases for news matching
+# 📋 NSE STOCKS
 # ══════════════════════════════════════════════════════════════════════
 
 STOCKS = {
@@ -167,7 +151,6 @@ STOCKS = {
     "PAYTM.NS":      {"name": "Paytm",                 "aliases": ["paytm","one97"],                                   "sector": "Fintech"},
 }
 
-# Blacklist — in stocks ko fallback signal mein mat lo (Angel One data unreliable)
 SIGNAL_BLACKLIST = {"ADANIGREEN.NS"}
 
 COMMODITY_IMPACT = {
@@ -181,10 +164,6 @@ COMMODITY_IMPACT = {
     "coal":        ["COALINDIA.NS","NTPC.NS","TATAPOWER.NS","SAIL.NS"],
     "cement":      ["ULTRACEMCO.NS","GRASIM.NS","AMBUJACEM.NS","ACC.NS"],
 }
-
-# ══════════════════════════════════════════════════════════════════════
-# 🔌 ANGEL ONE — Symbol Token Map (NSE symbol → Angel One token ID)
-# ══════════════════════════════════════════════════════════════════════
 
 NSE_SYMBOL_TOKENS = {
     "RELIANCE.NS":    {"token": "2885",   "symbol": "RELIANCE-EQ"},
@@ -251,7 +230,6 @@ NSE_SYMBOL_TOKENS = {
     "NMDC.NS":        {"token": "2379",   "symbol": "NMDC-EQ"},
     "RVNL.NS":        {"token": "543395", "symbol": "RVNL-EQ"},
     "IRFC.NS":        {"token": "543257", "symbol": "IRFC-EQ"},
-    # Additional stocks
     "TITAN.NS":       {"token": "3506",   "symbol": "TITAN-EQ"},
     "JBMA.NS":        {"token": "17875",  "symbol": "JBMA-EQ"},
     "CONCOR.NS":      {"token": "694",    "symbol": "CONCOR-EQ"},
@@ -291,56 +269,97 @@ NSE_SYMBOL_TOKENS = {
 }
 
 # ══════════════════════════════════════════════════════════════════════
-# 💼 PORTFOLIO
+# ✅ BUG FIX 1 & 2 — DATE-AWARE TRADE COUNTER (restart-safe)
+# Open positions KABHI count nahi honge — sirf confirmed new trades
 # ══════════════════════════════════════════════════════════════════════
 
-MAX_TRADES_PER_DAY = 3   # Din mein max 3 trades
+MAX_TRADES_PER_DAY = 3
 
-portfolio = {
-    "capital":          PAPER_CAPITAL,
-    "available":        PAPER_CAPITAL,
-    "positions":        {},
-    "closed_trades":    [],
-    "win_count":        0,
-    "total_signals":    0,
-    "pending_signal":   None,
-    "last_scan_time":   None,
-    "last_news_time":   None,
-    "seen_headlines":   set(),
-    "trades_today":     0,
-    "today_date":       None,
+def _get_ist_date() -> str:
+    """IST current date string"""
+    IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    return datetime.datetime.now(IST).strftime("%Y-%m-%d")
+
+# Separate per-user trade counters — restart-safe via date check
+_trade_counter = {
+    "ankur":  {"date": "", "count": 0},
+    "cousin": {"date": "", "count": 0},
 }
 
-def reset_daily_limit():
-    today = datetime.date.today().isoformat()
-    if portfolio["today_date"] != today:
-        portfolio["today_date"]   = today
-        portfolio["trades_today"] = 0
-        portfolio["user_trades"]  = set()  # Har din reset — naya din fresh start!
+def _get_user_key(user_id: str) -> str:
+    """Map chat ID to user key"""
+    if str(user_id) == str(MY_CHAT_ID):
+        return "ankur"
+    return "cousin"
+
+def get_trades_today(user_id: str) -> int:
+    """
+    ✅ FIX: Date-aware counter.
+    Agar naya din aa gaya → auto-reset.
+    Open positions NEVER count honge.
+    """
+    key   = _get_user_key(user_id)
+    today = _get_ist_date()
+    state = _trade_counter[key]
+    if state["date"] != today:
+        state["date"]  = today
+        state["count"] = 0
+    return state["count"]
+
+def increment_trade(user_id: str):
+    """
+    ✅ FIX: Call ONLY when a brand new trade is confirmed.
+    Positions count nahi hoti — sirf yahan se count badhe.
+    """
+    key   = _get_user_key(user_id)
+    today = _get_ist_date()
+    state = _trade_counter[key]
+    if state["date"] != today:
+        state["date"]  = today
+        state["count"] = 0
+    state["count"] += 1
+
+def can_trade_user(user_id: str) -> bool:
+    """Check if this specific user can take another trade today"""
+    open_count = sum(
+        1 for pos in portfolio["positions"].values()
+        if str(pos.get("user_id","")) == str(user_id)
+    )
+    return get_trades_today(user_id) < MAX_TRADES_PER_DAY and open_count < MAX_OPEN_POSITIONS
+
+def trades_left_user(user_id: str) -> int:
+    return max(0, MAX_TRADES_PER_DAY - get_trades_today(user_id))
+
+# ── Portfolio (legacy helpers kept for report/display) ─────────────
+
+portfolio = {
+    "capital":        PAPER_CAPITAL,
+    "available":      PAPER_CAPITAL,
+    "positions":      {},
+    "closed_trades":  [],
+    "win_count":      0,
+    "total_signals":  0,
+    "pending_signal": None,
+    "last_scan_time": None,
+    "last_news_time": None,
+    "seen_headlines": set(),
+    "user_trades":    set(),   # tracks "symbol_userid" to prevent duplicate positions
+}
 
 def can_trade() -> bool:
-    reset_daily_limit()
-    open_count = len(portfolio["positions"])
-    return portfolio["trades_today"] < MAX_TRADES_PER_DAY and open_count < MAX_OPEN_POSITIONS
-
-def trades_left() -> int:
-    reset_daily_limit()
-    return MAX_TRADES_PER_DAY - portfolio["trades_today"]
+    """Generic check — used in scan loop (checks if ANYONE can still trade)"""
+    return any(can_trade_user(uid) for uid in [MY_CHAT_ID, COUSIN_CHAT_ID] if uid)
 
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger      = logging.getLogger(__name__)
-bot_app     = None
+logger  = logging.getLogger(__name__)
+bot_app = None
 
 # ══════════════════════════════════════════════════════════════════════
 # 🔌 ANGEL ONE SESSION MANAGER
 # ══════════════════════════════════════════════════════════════════════
 
 class AngelOneSession:
-    """
-    Angel One SmartAPI — Live price data.
-    Auto-login with TOTP, 24h session auto-refresh.
-    """
     def __init__(self):
         self.obj           = None
         self.auth_token    = None
@@ -356,21 +375,17 @@ class AngelOneSession:
         async with self._lock:
             try:
                 if not all([ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_SECRET_KEY, ANGEL_TOTP_KEY]):
-                    logger.warning("⚠️  Angel One credentials set nahi hain! Env vars check karo.")
+                    logger.warning("⚠️  Angel One credentials set nahi hain!")
                     self.login_failed = True
                     return False
-
                 from SmartApi import SmartConnect
                 self.obj  = SmartConnect(api_key=ANGEL_API_KEY)
                 totp_code = self._totp()
-                logger.info(f"🔐 Angel One login — Client: {ANGEL_CLIENT_ID}")
-
                 loop = asyncio.get_event_loop()
                 data = await loop.run_in_executor(
                     None,
                     lambda: self.obj.generateSession(ANGEL_CLIENT_ID, ANGEL_SECRET_KEY, totp_code)
                 )
-
                 if data and data.get("status") is True:
                     self.auth_token    = data["data"]["jwtToken"]
                     self.refresh_token = data["data"]["refreshToken"]
@@ -381,12 +396,6 @@ class AngelOneSession:
                 else:
                     msg = data.get("message", "Unknown") if data else "No response"
                     logger.error(f"❌ Angel One login failed: {msg}")
-                    if "Invalid Token" in str(msg):
-                        logger.error("   → ANGEL_TOTP_KEY check karo (Base32 format mein hona chahiye)")
-                    elif "Invalid Client" in str(msg):
-                        logger.error("   → ANGEL_CLIENT_ID check karo")
-                    elif "Invalid Password" in str(msg) or "Invalid Pin" in str(msg):
-                        logger.error("   → ANGEL_SECRET_KEY (4-digit PIN) check karo")
                     self.login_failed = True
                     return False
             except Exception as e:
@@ -402,31 +411,22 @@ class AngelOneSession:
         if self.last_login:
             age = (datetime.datetime.now() - self.last_login).total_seconds()
             if age > 23 * 3600:
-                logger.info("🔄 Angel One session expire — re-login...")
                 return await self.login()
         return True
 
-    async def get_bulk_market_data(self, symbols: list[str]) -> dict:
-        """
-        Bulk market data — ek call mein max 50 tokens.
-        Returns {symbol_ns: {price, change_pct, high, low, volume, volume_ratio, source}}
-        """
+    async def get_bulk_market_data(self, symbols: list) -> dict:
         if not await self.ensure_session():
             return {}
-
-        result   = {}
-        tokens   = []
-        sym_map  = {}  # token → symbol_ns
-
+        result  = {}
+        tokens  = []
+        sym_map = {}
         for sym in symbols:
             info = NSE_SYMBOL_TOKENS.get(sym)
             if info:
                 tokens.append(info["token"])
                 sym_map[info["token"]] = sym
-
         if not tokens:
             return {}
-
         loop = asyncio.get_event_loop()
         try:
             for i in range(0, len(tokens), 50):
@@ -435,11 +435,8 @@ class AngelOneSession:
                     None,
                     lambda b=batch: self.obj.getMarketData("FULL", {"NSE": b})
                 )
-
                 if not (resp and resp.get("status") and resp.get("data")):
-                    # Session expire check
                     if resp and resp.get("errorCode") in ["AB1010","AB1011","AG8001"]:
-                        logger.info("🔄 Angel session expired — re-login...")
                         self.auth_token = None
                         self.last_login = None
                         if await self.login():
@@ -449,23 +446,19 @@ class AngelOneSession:
                             )
                     if not (resp and resp.get("status") and resp.get("data")):
                         continue
-
                 for item in resp["data"].get("fetched", []):
                     token  = str(item.get("symbolToken", ""))
                     sym_ns = sym_map.get(token)
                     if not sym_ns:
                         continue
-
                     ltp   = float(item.get("ltp", 0))
                     close = float(item.get("close", ltp))
                     if ltp <= 0:
                         continue
-
                     change_pct = round((ltp - close) / close * 100, 2) if close else 0
                     vol        = float(item.get("tradeVolume", 0))
                     avg_vol    = float(item.get("avgTradeVolume", vol or 1))
                     vol_ratio  = round(vol / avg_vol, 2) if avg_vol > 0 else 1.0
-
                     result[sym_ns] = {
                         "price":        round(ltp, 2),
                         "change_pct":   change_pct,
@@ -477,15 +470,12 @@ class AngelOneSession:
                         "volume_ratio": max(vol_ratio, 0.1),
                         "source":       "AngelOne",
                     }
-
                 await asyncio.sleep(0.3)
-
         except Exception as e:
             logger.error(f"Angel bulk data error: {e}")
             if "token" in str(e).lower() or "session" in str(e).lower():
                 self.auth_token = None
                 self.last_login = None
-
         logger.info(f"✅ AngelOne: {len(result)}/{len(symbols)} prices fetched")
         return result
 
@@ -500,11 +490,10 @@ class AngelOneSession:
         return "⏳ Angel One: connecting..."
 
 
-# Global Angel One session
 angel = AngelOneSession()
 
 # ══════════════════════════════════════════════════════════════════════
-# 📤 SEND TO BOTH — Ankur + Cousin
+# 📤 SEND HELPERS
 # ══════════════════════════════════════════════════════════════════════
 
 async def send_to_all(text: str, parse_mode: str = "Markdown"):
@@ -517,12 +506,20 @@ async def send_to_all(text: str, parse_mode: str = "Markdown"):
             except Exception as e:
                 logger.error(f"Send failed {cid}: {e}")
 
+async def _send_to_user(user_id, msg: str):
+    if user_id:
+        try:
+            await bot_app.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Send failed: {e}")
+    else:
+        await send_to_all(msg)
+
 # ══════════════════════════════════════════════════════════════════════
 # 📰 FETCH ALL NEWS
 # ══════════════════════════════════════════════════════════════════════
 
-async def fetch_nse_announcements(client: httpx.AsyncClient) -> list[dict]:
-    """NSE official real-time corporate announcements"""
+async def fetch_nse_announcements(client: httpx.AsyncClient) -> list:
     articles = []
     try:
         headers = {
@@ -553,14 +550,12 @@ async def fetch_nse_announcements(client: httpx.AsyncClient) -> list[dict]:
                     "symbol":   symbol,
                     "realtime": True,
                 })
-            logger.info(f"NSE announcements: {len(articles)} fetched")
     except Exception as e:
         logger.debug(f"NSE announcements failed: {e}")
     return articles
 
 
-async def fetch_bse_announcements(client: httpx.AsyncClient) -> list[dict]:
-    """BSE official real-time corporate announcements"""
+async def fetch_bse_announcements(client: httpx.AsyncClient) -> list:
     articles = []
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -583,22 +578,19 @@ async def fetch_bse_announcements(client: httpx.AsyncClient) -> list[dict]:
                     "link":     "https://www.bseindia.com/corporates/ann.html",
                     "realtime": True,
                 })
-            logger.info(f"BSE announcements: {len(articles)} fetched")
     except Exception as e:
         logger.debug(f"BSE announcements failed: {e}")
     return articles
 
 
-async def fetch_all_news() -> list[dict]:
+async def fetch_all_news() -> list:
     all_articles = []
     portfolio["seen_headlines"] = set()
-
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         nse_articles = await fetch_nse_announcements(client)
         bse_articles = await fetch_bse_announcements(client)
         all_articles.extend(nse_articles)
         all_articles.extend(bse_articles)
-
         for feed in NEWS_FEEDS:
             try:
                 resp   = await client.get(feed["url"])
@@ -617,17 +609,14 @@ async def fetch_all_news() -> list[dict]:
                     })
             except Exception as e:
                 logger.debug(f"Feed failed {feed['name']}: {e}")
-
     portfolio["last_news_time"] = datetime.datetime.now().strftime("%I:%M %p")
-    realtime_count = sum(1 for a in all_articles if a.get("realtime"))
-    logger.info(f"Total: {len(all_articles)} articles ({realtime_count} real-time NSE/BSE)")
     return all_articles
 
 # ══════════════════════════════════════════════════════════════════════
 # 🔗 NEWS → STOCK MATCH
 # ══════════════════════════════════════════════════════════════════════
 
-def match_news_to_stocks(articles: list[dict]) -> dict:
+def match_news_to_stocks(articles: list) -> dict:
     stock_news = {}
     for art in articles:
         text    = (art["headline"] + " " + art["summary"]).lower()
@@ -647,11 +636,10 @@ def match_news_to_stocks(articles: list[dict]) -> dict:
     return stock_news
 
 # ══════════════════════════════════════════════════════════════════════
-# 💹 PRICE DATA — Angel One Primary + NSE Fallback
+# 💹 PRICE DATA
 # ══════════════════════════════════════════════════════════════════════
 
-async def get_nse_price(symbol: str, client: httpx.AsyncClient) -> dict | None:
-    """NSE India scraping — fallback"""
+async def get_nse_price(symbol: str, client: httpx.AsyncClient):
     try:
         nse_sym = symbol.replace(".NS", "").replace("&", "%26")
         headers = {
@@ -684,8 +672,7 @@ async def get_nse_price(symbol: str, client: httpx.AsyncClient) -> dict | None:
     return None
 
 
-async def _nse_yfinance_fallback(symbols: list[str]) -> dict:
-    """NSE scraping + yfinance fallback prices"""
+async def _nse_yfinance_fallback(symbols: list) -> dict:
     result = {}
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         try:
@@ -694,7 +681,6 @@ async def _nse_yfinance_fallback(symbols: list[str]) -> dict:
             })
         except:
             pass
-
         for sym in symbols:
             data = await get_nse_price(sym, client)
             if data:
@@ -718,58 +704,34 @@ async def _nse_yfinance_fallback(symbols: list[str]) -> dict:
                 except:
                     pass
             await asyncio.sleep(0.15)
-
-    logger.info(f"Fallback: {len(result)}/{len(symbols)} stocks")
     return result
 
 
-async def get_price_data(symbols: list[str]) -> dict:
-    """
-    Live NSE prices — 3 tier system:
-    1. Angel One SmartAPI (real-time LTP + OHLC + Volume) ← PRIMARY
-    2. NSE website scraping ← FALLBACK
-    3. yfinance ← LAST RESORT
-    """
-    result = {}
-
-    # ── Tier 1: Angel One bulk market data ────────────────────────
-    angel_data = await angel.get_bulk_market_data(symbols)
+async def get_price_data(symbols: list) -> dict:
+    result      = {}
+    angel_data  = await angel.get_bulk_market_data(symbols)
     result.update(angel_data)
-
-    # ── Tier 2+3: NSE scraping + yfinance for missed symbols ──────
     missed = [s for s in symbols if s not in result]
     if missed:
-        logger.info(f"📡 Fallback for {len(missed)} stocks (NSE + yfinance)...")
         fallback_data = await _nse_yfinance_fallback(missed)
         result.update(fallback_data)
-
-    # Summary log
-    angel_count    = sum(1 for d in result.values() if d.get("source") == "AngelOne")
-    fallback_count = len(result) - angel_count
-    logger.info(
-        f"📊 Prices: {len(result)}/{len(symbols)} | "
-        f"AngelOne: {angel_count} | Fallback: {fallback_count}"
-    )
     return result
 
 # ══════════════════════════════════════════════════════════════════════
-# 🧠 AI ANALYSIS — Full intelligence
+# 🧠 AI ANALYSIS
 # ══════════════════════════════════════════════════════════════════════
 
-async def ai_analyze_news(articles: list[dict], stock_news: dict, price_data: dict) -> dict | None:
-
+async def ai_analyze_news(articles: list, stock_news: dict, price_data: dict):
     all_news_text = "\n".join([
         f"[{a['source']} | {a['type'].upper()}] {a['headline']}\n  {a['summary'][:200]}"
         for a in articles[:50]
     ])
-
     stock_news_text = ""
     for sym, arts in list(stock_news.items())[:20]:
         name       = STOCKS[sym]["name"]
         headlines  = " | ".join([a["headline"] for a in arts[:3]])
         price_info = f"₹{price_data[sym]['price']} ({price_data[sym]['change_pct']:+.2f}%)" if sym in price_data else "NA"
         stock_news_text += f"\n• {name} ({sym}) [{price_info}]: {headlines}"
-
     movers_text = ""
     if price_data:
         sorted_by_move = sorted(price_data.items(), key=lambda x: abs(x[1]['change_pct']), reverse=True)
@@ -828,7 +790,7 @@ Respond ONLY in JSON (no markdown):
             temperature=0.3,
             messages=[
                 {"role": "system", "content": "You are an expert NSE swing trader. Respond in valid JSON only. No markdown, no explanation."},
-                {"role": "user", "content": prompt}
+                {"role": "user",   "content": prompt}
             ]
         )
         raw  = resp.choices[0].message.content.strip()
@@ -860,7 +822,7 @@ NEWS_LABELS = {
     "SECTOR_ROTATION":    "🔄 Sector Rotation!",
 }
 
-def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
+def format_alert(signal: dict, stock_articles: list) -> list:
     messages = []
     price    = signal["entry"]
     d_emo    = "📈" if signal["direction"] == "BUY" else "📉"
@@ -872,7 +834,6 @@ def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
     tgt_pct  = round(abs(signal["target"] - price) / price * 100, 2)
     others   = [STOCKS[s]["name"] for s in signal.get("other_stocks_impacted",[]) if s in STOCKS][:3]
     key_news = "\n".join([f"  • {n}" for n in signal.get("key_news", [])[:4]])
-
     g_mood   = signal.get("global_market", market_bias["direction"])
     g_emo    = {"BULLISH":"🟢 Bullish","BEARISH":"🔴 Bearish","NEUTRAL":"🟡 Neutral"}.get(g_mood,"🟡 Neutral")
     g_reason = signal.get("global_reason", market_bias.get("reason",""))
@@ -898,8 +859,7 @@ def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
         f"🎯 Target:  ₹{signal['target']:,.2f} (+{tgt_pct}%)\n"
         f"⚖️ R:R:     {signal.get('risk_reward','1:2')}\n\n"
         f"📦 {qty} shares × ₹{price} = ₹{cost:,.0f}\n"
-        f"💼 Balance: ₹{portfolio['available']:,.0f}\n"
-        f"🔢 Aaj ke trades: {portfolio['trades_today']}/{MAX_TRADES_PER_DAY}\n\n"
+        f"💼 Balance: ₹{portfolio['available']:,.0f}\n\n"
         f"🤔 *YES* lena hai | *NO* skip karo"
     )
     messages.append(msg1)
@@ -918,14 +878,12 @@ def format_alert(signal: dict, stock_articles: list[dict]) -> list[str]:
 # 🔄 POSITION MONITOR
 # ══════════════════════════════════════════════════════════════════════
 
-async def smart_trade_manager(price_data: dict, articles: list[dict]):
+async def smart_trade_manager(price_data: dict, articles: list):
     to_close = []
-
     for pos_key, pos in list(portfolio["positions"].items()):
         sym    = pos.get("symbol", pos_key.split("_")[0])
         if sym not in price_data:
             continue
-
         curr    = price_data[sym]["price"]
         is_buy  = pos["direction"] == "BUY"
         entry   = pos["entry"]
@@ -934,28 +892,22 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
         qty     = pos["qty"]
         name    = pos["name"]
         user_id = pos.get("user_id")
-
         pnl     = (curr - entry) * qty if is_buy else (entry - curr) * qty
         pnl_pct = round((curr - entry) / entry * 100, 2) if is_buy else round((entry - curr) / entry * 100, 2)
-
         total_move   = abs(target - entry)
         curr_move    = abs(curr - entry) if (is_buy and curr > entry) or (not is_buy and curr < entry) else 0
         tgt_progress = round(curr_move / total_move * 100) if total_move > 0 else 0
         sl_dist_pct  = round(abs(curr - sl) / curr * 100, 2)
-
         hit_tgt = (is_buy and curr >= target) or (not is_buy and curr <= target)
         hit_sl  = (is_buy and curr <= sl)     or (not is_buy and curr >= sl)
 
         if hit_tgt:
             new_bal = portfolio["available"] + pos["cost"] + pnl
             msg = (
-                f"🎯 *TARGET HIT! PROFIT!*\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"📊 *{name}*\n"
-                f"Entry: ₹{entry:,.2f} → Exit: ₹{curr:,.2f}\n"
+                f"🎯 *TARGET HIT! PROFIT!*\n━━━━━━━━━━━━━━━━━━\n"
+                f"📊 *{name}*\nEntry: ₹{entry:,.2f} → Exit: ₹{curr:,.2f}\n"
                 f"Qty: {qty} | ✅ *Profit: +₹{pnl:,.0f}* (+{pnl_pct:.1f}%)\n"
-                f"💼 New Balance: ₹{new_bal:,.0f}\n\n"
-                f"🎉 Zabardast trade bhai!"
+                f"💼 New Balance: ₹{new_bal:,.0f}\n\n🎉 Zabardast trade bhai!"
             )
             await _send_to_user(user_id, msg)
             to_close.append((pos_key, pnl, pos["cost"]))
@@ -963,44 +915,33 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
         elif hit_sl:
             new_bal = portfolio["available"] + pos["cost"] + pnl
             msg = (
-                f"🛑 *STOP LOSS HIT!*\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"📊 *{name}*\n"
-                f"Entry: ₹{entry:,.2f} → Exit: ₹{curr:,.2f}\n"
+                f"🛑 *STOP LOSS HIT!*\n━━━━━━━━━━━━━━━━━━\n"
+                f"📊 *{name}*\nEntry: ₹{entry:,.2f} → Exit: ₹{curr:,.2f}\n"
                 f"Qty: {qty} | ❌ *Loss: ₹{pnl:,.0f}* ({pnl_pct:.1f}%)\n"
-                f"💼 Balance: ₹{new_bal:,.0f}\n\n"
-                f"💪 SL ne protect kiya — agli trade mein recover karenge!"
+                f"💼 Balance: ₹{new_bal:,.0f}\n\n💪 SL ne protect kiya — agli trade mein recover karenge!"
             )
             await _send_to_user(user_id, msg)
             to_close.append((pos_key, pnl, pos["cost"]))
 
         else:
-            stock_arts = [a for a in articles if sym.replace(".NS","").lower() in (a["headline"]+a["summary"]).lower()]
+            stock_arts        = [a for a in articles if sym.replace(".NS","").lower() in (a["headline"]+a["summary"]).lower()]
             bad_news_keywords  = ["loss","fall","down","decline","weak","negative","bearish","sell","downgrade","cut","concern","risk","crash","drop"]
             good_news_keywords = ["profit","rise","up","growth","strong","positive","bullish","buy","upgrade","order","win","record","high","beat"]
             news_text     = " ".join([a["headline"] for a in stock_arts]).lower()
             has_bad_news  = any(kw in news_text for kw in bad_news_keywords)
             has_good_news = any(kw in news_text for kw in good_news_keywords)
-
             is_going_toward_target = (is_buy and curr > entry) or (not is_buy and curr < entry)
-            sharp_reversal = False
 
             if is_going_toward_target and tgt_progress >= 20 and has_bad_news:
-                sharp_reversal = True
-                bad_arts = [a for a in stock_arts if any(kw in a["headline"].lower() for kw in bad_news_keywords)]
+                bad_arts  = [a for a in stock_arts if any(kw in a["headline"].lower() for kw in bad_news_keywords)]
                 alert_msg = (
-                    f"🚨 *TURANT ALERT — REVERSAL + BAD NEWS!*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📊 *{name}*\n"
-                    f"Entry: ₹{entry:,.2f} | Current: ₹{curr:,.2f}\n"
+                    f"🚨 *TURANT ALERT — REVERSAL + BAD NEWS!*\n━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 *{name}*\nEntry: ₹{entry:,.2f} | Current: ₹{curr:,.2f}\n"
                     f"P&L abhi: {'+'if pnl>=0 else ''}₹{pnl:,.0f} ({pnl_pct:+.1f}%)\n"
                     f"Target: ₹{target:,.2f} | Progress: {tgt_progress}%\n\n"
                     f"⚠️ *Bad News aa gayi:*\n"
                     + "\n".join([f"  • _{a['headline'][:100]}_" for a in bad_arts[:3]])
-                    + f"\n\n💡 *Kya karna hai:*\n"
-                    f"• Profit hai → Exit consider karo\n"
-                    f"• Loss hai → SL ka wait karo ya cut karo\n"
-                    f"• Apna judgment use karo!"
+                    + f"\n\n💡 Kya karna hai:\n• Profit hai → Exit consider karo\n• Loss hai → SL ka wait karo\n• Apna judgment use karo!"
                 )
                 await _send_to_user(user_id, alert_msg)
 
@@ -1008,25 +949,20 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
                 pos["good_news_alerted"] = True
                 good_arts = [a for a in stock_arts if any(kw in a["headline"].lower() for kw in good_news_keywords)]
                 alert_msg = (
-                    f"💡 *GOOD NEWS — POSITION KE FAVOR MEIN!*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📊 *{name}*\n"
-                    f"Current: ₹{curr:,.2f} | P&L: {'+'if pnl>=0 else ''}₹{pnl:,.0f}\n\n"
+                    f"💡 *GOOD NEWS — POSITION KE FAVOR MEIN!*\n━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 *{name}*\nCurrent: ₹{curr:,.2f} | P&L: {'+'if pnl>=0 else ''}₹{pnl:,.0f}\n\n"
                     f"✅ *Positive News:*\n"
                     + "\n".join([f"  • _{a['headline'][:100]}_" for a in good_arts[:3]])
                     + f"\n\n📈 *Position strong ho sakti hai — hold karo!*"
                 )
                 await _send_to_user(user_id, alert_msg)
 
-            if not sharp_reversal and stock_arts:
+            if stock_arts:
                 good_arts = [a for a in stock_arts if any(kw in a["headline"].lower() for kw in good_news_keywords)]
                 bad_arts  = [a for a in stock_arts if any(kw in a["headline"].lower() for kw in bad_news_keywords)]
-
-                # Spam fix — sirf naya news bhejo, same news baar baar nahi
                 last_sent = pos.get("last_news_headlines", set())
                 new_good  = [a for a in good_arts if a["headline"] not in last_sent]
                 new_bad   = [a for a in bad_arts  if a["headline"] not in last_sent]
-
                 if new_good or new_bad:
                     news_msg  = f"📰 *{name} — News Update:*\n━━━━━━━━━━━━━━━━━━\n"
                     news_msg += f"Current: ₹{curr:,.2f} | P&L: {'+'if pnl>=0 else ''}₹{pnl:,.0f} ({pnl_pct:+.1f}%)\n"
@@ -1040,14 +976,11 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
                         for a in new_bad[:3]:
                             news_msg += f"  • _{a['headline'][:100]}_\n"
                     await _send_to_user(user_id, news_msg)
-
-                    # Update seen headlines
                     pos["last_news_headlines"] = last_sent | {a["headline"] for a in good_arts+bad_arts}
 
             if tgt_progress >= 80 and has_bad_news:
                 msg = (
-                    f"⚠️ *EXIT NOW — TARGET NEAR + BAD NEWS!*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"⚠️ *EXIT NOW — TARGET NEAR + BAD NEWS!*\n━━━━━━━━━━━━━━━━━━\n"
                     f"📊 *{name}* — {tgt_progress}% target complete\n"
                     f"Current: ₹{curr:,.2f} | P&L: +₹{pnl:,.0f}\n\n"
                     f"📰 *Bad news aa rahi hai:*\n"
@@ -1058,8 +991,7 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
 
             elif sl_dist_pct <= 1.0 and has_good_news:
                 msg = (
-                    f"💡 *HOLD — NEWS SUPPORT HAI!*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"💡 *HOLD — NEWS SUPPORT HAI!*\n━━━━━━━━━━━━━━━━━━\n"
                     f"📊 *{name}* — SL ke paas hai\n"
                     f"Current: ₹{curr:,.2f} | SL: ₹{sl:,.2f}\n\n"
                     f"📰 *Good news support de rahi hai:*\n"
@@ -1072,13 +1004,10 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
                 new_sl = round(entry * 1.01, 2) if is_buy else round(entry * 0.99, 2)
                 pos["trailed"] = True
                 msg = (
-                    f"📈 *TRAIL SL KARO! {tgt_progress}% TARGET DONE!*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📊 *{name}*\n"
-                    f"Current: ₹{curr:,.2f} | P&L: +₹{pnl:,.0f}\n\n"
-                    f"🛑 *Old SL: ₹{sl:,.2f}*\n"
-                    f"✅ *New SL: ₹{new_sl:,.2f}* (breakeven)\n\n"
-                    f"💡 Apne broker mein SL update karo — loss impossible ab!"
+                    f"📈 *TRAIL SL KARO! {tgt_progress}% TARGET DONE!*\n━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 *{name}*\nCurrent: ₹{curr:,.2f} | P&L: +₹{pnl:,.0f}\n\n"
+                    f"🛑 *Old SL: ₹{sl:,.2f}*\n✅ *New SL: ₹{new_sl:,.2f}* (breakeven)\n\n"
+                    f"💡 Broker mein SL update karo — loss impossible ab!"
                 )
                 pos["sl"] = new_sl
                 await _send_to_user(user_id, msg)
@@ -1100,17 +1029,7 @@ async def smart_trade_manager(price_data: dict, articles: list[dict]):
             del portfolio["positions"][pos_key]
 
 
-async def _send_to_user(user_id: str | None, msg: str):
-    if user_id:
-        try:
-            await bot_app.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Send failed: {e}")
-    else:
-        await send_to_all(msg)
-
-
-async def check_positions(price_data: dict, articles: list[dict] = []):
+async def check_positions(price_data: dict, articles: list = []):
     await smart_trade_manager(price_data, articles)
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1127,7 +1046,6 @@ async def run_scan(silent: bool = False):
             f"📊 {len(STOCKS)} NSE stocks\n"
             f"🔌 {angel.status_text()}"
         )
-
     articles   = await fetch_all_news()
     price_data = await get_price_data(list(STOCKS.keys()))
     if price_data:
@@ -1140,8 +1058,8 @@ async def run_scan(silent: bool = False):
     if not can_trade():
         await send_to_all(
             f"⛔ *Aaj ke {MAX_TRADES_PER_DAY} trades ho gaye!*\n"
-            f"Kal subah 9 AM pe counter reset hoga.\n"
-            f"Scan jaari hai — positions monitor hoti rahengi. 👀"
+            f"Kal subah counter reset hoga.\n"
+            f"Scan jaari hai — positions monitor hongi. 👀"
         )
         return
 
@@ -1154,7 +1072,6 @@ async def run_scan(silent: bool = False):
             await send_to_all(msg)
             await asyncio.sleep(1)
     else:
-        # Koi strong news signal nahi — koi trade nahi
         open_count = len(portfolio["positions"])
         await send_to_all(
             f"📭 *Scan complete — Koi strong signal nahi*\n"
@@ -1164,7 +1081,6 @@ async def run_scan(silent: bool = False):
             f"⏳ Agli scan {SCAN_INTERVAL_MIN} min mein\n"
             f"_Sirf strong news pe trade hoga — patience rakho!_ 💪"
         )
-
 
 
 async def is_market_open() -> bool:
@@ -1191,16 +1107,13 @@ async def position_monitor_loop():
 
 
 async def send_daily_report():
-    """3:30 PM pe automatic Daily P&L Report — dono ko"""
     IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
     now = datetime.datetime.now(IST)
-
     closed    = portfolio["closed_trades"]
     open_pos  = portfolio["positions"]
     net_worth = portfolio["available"] + sum(p["cost"] for p in open_pos.values())
     total_pnl = sum(t["pnl"] for t in closed)
     overall_pnl_pct = round((net_worth - PAPER_CAPITAL) / PAPER_CAPITAL * 100, 2)
-
     today_str    = now.strftime("%d %b %Y")
     today_trades = [t for t in closed if today_str in t.get("time", "")]
     today_pnl    = sum(t["pnl"] for t in today_trades)
@@ -1224,13 +1137,18 @@ async def send_daily_report():
     day_emo      = "🎉" if today_pnl > 0 else ("😐" if today_pnl == 0 else "😔")
     tot_emo      = "🚀" if total_pnl > 0 else ("😐" if total_pnl == 0 else "📉")
 
+    # ✅ Per-user trade count for report
+    ankur_trades  = get_trades_today(MY_CHAT_ID)  if MY_CHAT_ID  else 0
+    cousin_trades = get_trades_today(COUSIN_CHAT_ID) if COUSIN_CHAT_ID else 0
+
     msg = (
         f"🌅 *AAJ KA REPORT — {today_str}* {day_emo}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📅 *Aaj ka P&L:*\n"
         f"{'✅' if today_pnl >= 0 else '❌'} Closed trades: {'+'if today_pnl>=0 else ''}₹{today_pnl:,.0f}\n"
         f"📂 Open positions P&L: {'+'if open_pnl>=0 else ''}₹{open_pnl:,.0f}\n"
-        f"🏆 Aaj ke trades: {len(today_trades)} (✅{today_wins} ❌{today_losses})\n\n"
+        f"🏆 Aaj ke trades: {len(today_trades)} (✅{today_wins} ❌{today_losses})\n"
+        f"👤 Ankur: {ankur_trades}/{MAX_TRADES_PER_DAY} | Cousin: {cousin_trades}/{MAX_TRADES_PER_DAY}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{tot_emo} *Overall Performance:*\n"
         f"💰 Capital: ₹{PAPER_CAPITAL:,.0f}\n"
@@ -1269,7 +1187,6 @@ async def send_daily_report():
 
 
 async def daily_report_loop():
-    """Roz 3:30 PM IST pe daily report — market close ke baad"""
     IST           = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
     reported_today = None
     await asyncio.sleep(120)
@@ -1295,7 +1212,7 @@ async def scan_loop():
             else:
                 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
                 now = datetime.datetime.now(IST)
-                logger.info(f"Market band hai — {now.strftime('%I:%M %p')} IST | Next open: 9:15 AM")
+                logger.info(f"Market band hai — {now.strftime('%I:%M %p')} IST")
         except Exception as e:
             logger.error(f"Scan error: {e}")
         await asyncio.sleep(SCAN_INTERVAL_MIN * 60)
@@ -1308,25 +1225,19 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🇮🇳 *NSE News Intelligence Agent*\n━━━━━━━━━━━━━━━━\n"
         f"💼 Capital: ₹{PAPER_CAPITAL:,.0f} | Scan: Har {SCAN_INTERVAL_MIN} min\n\n"
-        "📰 *Kya analyze hota hai:*\n"
-        "📋 Company ko naye orders/contracts\n"
-        "📊 Quarterly P&L results\n"
-        "🤝 Mergers & Acquisitions\n"
-        "⚗️ Metal/Crude → affected stocks\n"
-        "🏛️ Govt/RBI policy changes\n"
-        "💰 FII/DII buying selling\n"
-        "🌍 Global market impact\n\n"
         "Commands: /scan /news /portfolio /summary /status /help",
         parse_mode="Markdown"
     )
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Angel One + Agent live status"""
     market_status = "🟢 OPEN" if await is_market_open() else "🔴 CLOSED"
-    reset_daily_limit()
+    user_id = str(update.effective_user.id)
 
-    # Source breakdown
+    # ✅ Per-user trade count in status
+    my_trades     = get_trades_today(MY_CHAT_ID)     if MY_CHAT_ID     else 0
+    cousin_trades = get_trades_today(COUSIN_CHAT_ID) if COUSIN_CHAT_ID else 0
+
     source_info = ""
     if angel.auth_token:
         source_info = "📊 Price Source: Angel One SmartAPI (Live)"
@@ -1336,16 +1247,18 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         source_info = "📊 Price Source: NSE Scraping (Angel One connecting...)"
 
     msg = (
-        f"🔌 *Angel One SmartAPI*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔌 *Angel One SmartAPI*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{angel.status_text()}\n\n"
         f"📈 *Market:* {market_status}\n"
         f"{source_info}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💼 *Portfolio:*\n"
+        f"💰 Capital: ₹{PAPER_CAPITAL:,.0f}\n"
         f"💰 Available: ₹{portfolio['available']:,.0f}\n"
-        f"📂 Open Positions: {len(portfolio['positions'])}\n"
-        f"🔢 Aaj ke Trades: {portfolio['trades_today']}/{MAX_TRADES_PER_DAY}\n"
+        f"📂 Open Positions: {len(portfolio['positions'])}\n\n"
+        f"🔢 *Aaj ke Trades:*\n"
+        f"👤 Ankur: {my_trades}/{MAX_TRADES_PER_DAY}\n"
+        f"👤 Cousin: {cousin_trades}/{MAX_TRADES_PER_DAY}\n\n"
         f"🕐 Last Scan: {portfolio.get('last_scan_time', 'N/A')}\n\n"
         f"🌍 *Market Bias:* {market_bias['direction']}\n"
         f"_{market_bias.get('reason', 'N/A')}_"
@@ -1398,14 +1311,17 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     net_worth = portfolio["available"] + sum(p["cost"] for p in open_pos.values())
     overall_pnl_pct = round((net_worth - PAPER_CAPITAL) / PAPER_CAPITAL * 100, 2)
 
+    # ✅ Per-user counts
+    my_trades     = get_trades_today(MY_CHAT_ID)     if MY_CHAT_ID     else 0
+    cousin_trades = get_trades_today(COUSIN_CHAT_ID) if COUSIN_CHAT_ID else 0
+
     price_data = {}
     if open_pos:
         syms       = list(set(p.get("symbol", k.split("_")[0]) for k, p in open_pos.items()))
         price_data = await get_price_data(syms)
 
     msg1 = (
-        f"📊 *FULL TRADING DASHBOARD*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 *FULL TRADING DASHBOARD*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"💰 *Capital:* ₹{PAPER_CAPITAL:,.0f}\n"
         f"💼 *Net Worth:* ₹{net_worth:,.0f}\n"
         f"{'📈' if total_pnl>=0 else '📉'} *Total P&L:* {'+'if total_pnl>=0 else ''}₹{total_pnl:,.0f} ({'+' if overall_pnl_pct>=0 else ''}{overall_pnl_pct}%)\n"
@@ -1415,9 +1331,11 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Wins:    {wins}\n"
         f"❌ Losses:  {losses}\n"
         f"🎯 Win Rate: {win_rate}%\n"
-        f"📦 Total Trades: {len(closed)}\n"
-        f"🔢 Aaj ke trades: {portfolio['trades_today']}/{MAX_TRADES_PER_DAY}\n"
-        f"\n🔌 {angel.status_text()}"
+        f"📦 Total Trades: {len(closed)}\n\n"
+        f"🔢 *Aaj ke Trades:*\n"
+        f"👤 Ankur: {my_trades}/{MAX_TRADES_PER_DAY}\n"
+        f"👤 Cousin: {cousin_trades}/{MAX_TRADES_PER_DAY}\n\n"
+        f"🔌 {angel.status_text()}"
     )
     await update.message.reply_text(msg1, parse_mode="Markdown")
 
@@ -1432,10 +1350,8 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             total_move   = abs(pos["target"] - pos["entry"])
             curr_move    = abs(curr - pos["entry"]) if (is_buy and curr > pos["entry"]) or (not is_buy and curr < pos["entry"]) else 0
             progress     = round(curr_move / total_move * 100) if total_move > 0 else 0
-
             bars     = int(progress / 10)
             prog_bar = "🟢" * bars + "⬜" * (10 - bars)
-
             open_date = pos.get("open_date")
             if open_date:
                 days_open  = (datetime.datetime.now() - datetime.datetime.fromisoformat(open_date)).days
@@ -1443,8 +1359,6 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 time_str   = f"{days_open} din {hours_open} ghante" if days_open > 0 else f"{hours_open} ghante"
             else:
                 time_str = "N/A"
-
-            # Price source tag
             src = price_data.get(sym, {}).get("source", "?")
             lines.append(
                 f"\n{'📈' if is_buy else '📉'} *{pos['name']}*\n"
@@ -1480,26 +1394,15 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Help*\n━━━━━━━━━━━━━━━━\n"
-        "Alert kab aata hai:\n"
-        "• Company ko bada order/contract mila\n"
-        "• Q result behtareen ya bekaar\n"
-        "• Merger/takeover news\n"
-        "• Steel/Crude/Coal price change → related stocks\n"
-        "• RBI/Govt policy\n"
-        "• FII badi buying/selling\n\n"
-        "Alert aane par:\n"
-        "*YES* → Paper trade + saari news\n"
-        "*NO* → Skip\n\n"
-        "/scan — Abhi scan\n"
-        "/news — Latest headlines\n"
-        "/portfolio — Open positions\n"
-        "/summary — P&L dashboard\n"
-        "/status — Angel One + agent status",
+        "/scan — Abhi scan\n/news — Latest headlines\n"
+        "/portfolio — Open positions\n/summary — P&L dashboard\n"
+        "/status — Angel One + agent status\n\n"
+        "*YES* → Trade lo | *NO* → Skip",
         parse_mode="Markdown"
     )
 
 # ══════════════════════════════════════════════════════════════════════
-# 💬 YES / NO
+# 💬 YES / NO — ✅ FIXED: uses per-user date-aware counter
 # ══════════════════════════════════════════════════════════════════════
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1512,26 +1415,30 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "YES":
-        if not can_trade():
+        # ✅ FIX: date-aware per-user counter check (open positions count nahi honge)
+        if not can_trade_user(user_id):
+            trades_done = get_trades_today(user_id)
             await update.message.reply_text(
-                f"⛔ Aaj ke {MAX_TRADES_PER_DAY} trades ho gaye!\n"
-                f"Kal subah naya din — phir le lena. 😄"
+                f"⛔ *Tere {MAX_TRADES_PER_DAY} trades ho gaye aaj!*\n"
+                f"Trades liye: {trades_done}/{MAX_TRADES_PER_DAY}\n"
+                f"Kal subah naya din — phir le lena. 😄",
+                parse_mode="Markdown"
             )
             return
 
-        # Check 1: Kya is user ne pehle se yeh trade liya hai?
+        # Check: kya is user ne yeh stock already liya hai?
         trade_key = f"{signal['symbol']}_{user_id}"
         if trade_key in portfolio.get("user_trades", set()):
             await update.message.reply_text("⚠️ Tune yeh trade already le liya hai!")
             return
 
-        # Check 2: Kya yeh stock already open position mein hai? (dono ke liye)
-        sym = signal["symbol"]
+        # Check: kya yeh stock pehle se open hai?
+        sym       = signal["symbol"]
         open_syms = [p.get("symbol","") for p in portfolio["positions"].values()]
         if open_syms.count(sym) >= 1:
             await update.message.reply_text(
                 f"⚠️ *{signal['name']}* already open position mein hai!\n"
-                f"Same stock dobara nahi le sakte. Agli signal ka wait karo.",
+                f"Same stock dobara nahi le sakte.",
                 parse_mode="Markdown"
             )
             return
@@ -1560,12 +1467,11 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "open_time": datetime.datetime.now().strftime("%d %b %Y, %I:%M %p"),
             "open_date": datetime.datetime.now().isoformat(),
         }
-        if "user_trades" not in portfolio:
-            portfolio["user_trades"] = set()
         portfolio["user_trades"].add(trade_key)
 
-        portfolio["trades_today"] += 1
-        left = trades_left()
+        # ✅ FIX: sirf yahan increment hota hai — koi aur jagah nahi
+        increment_trade(user_id)
+        left = trades_left_user(user_id)
 
         bot: Bot = bot_app.bot
         try:
@@ -1577,7 +1483,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"{signal['direction']} {qty} shares @ ₹{price:,.2f}\n"
                     f"SL: ₹{signal['stop_loss']:,.2f} | T: ₹{signal['target']:,.2f}\n"
                     f"💼 Balance: ₹{portfolio['available']:,.0f}\n"
-                    f"🔢 Trades: {portfolio['trades_today']}/{MAX_TRADES_PER_DAY}"
+                    f"🔢 Tera trade count: {get_trades_today(user_id)}/{MAX_TRADES_PER_DAY}"
                     + (f" | {left} aur bache" if left > 0 else " | Aaj bas itne!")
                 ),
                 parse_mode="Markdown"
@@ -1607,8 +1513,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"💼 Net Worth: ₹{net_worth:,.0f}\n"
             f"{'📈' if total_pnl>=0 else '📉'} Total P&L: {'+'if total_pnl>=0 else ''}₹{total_pnl:,.0f}\n"
             f"📂 Open Positions: {open_pos}\n"
-            f"✅ Wins: {wins} | ❌ Loss: {len(closed)-wins} | 🎯 {win_rate}%\n"
-            f"🔢 Aaj ke trades: {portfolio['trades_today']}/{MAX_TRADES_PER_DAY}"
+            f"✅ Wins: {wins} | ❌ Loss: {len(closed)-wins} | 🎯 {win_rate}%"
         )
 
     elif text == "NO":
@@ -1635,7 +1540,6 @@ async def main():
     if missing:
         raise ValueError(f"Missing env vars: {missing}")
 
-    # ── Angel One startup login ──────────────────────────────────────
     logger.info("🔌 Angel One SmartAPI se connect ho raha hoon...")
     angel_ok = await angel.login()
     if angel_ok:
@@ -1643,7 +1547,6 @@ async def main():
     else:
         logger.warning("⚠️  Angel One login failed — NSE fallback use hoga")
 
-    # ── Telegram bot setup ───────────────────────────────────────────
     bot_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     for cmd, fn in [
         ("start",     cmd_start),
@@ -1661,7 +1564,6 @@ async def main():
     await bot_app.start()
     await bot_app.updater.start_polling(drop_pending_updates=True)
 
-    # ── Startup message ──────────────────────────────────────────────
     angel_line = (
         "🔌 Angel One: ✅ Connected — Live prices ON!"
         if angel_ok else
@@ -1670,12 +1572,11 @@ async def main():
     await send_to_all(
         f"🟢 *NSE News Intelligence Agent Online!*\n"
         f"💼 Capital: ₹{PAPER_CAPITAL:,.0f}\n"
-        f"📰 {len(NEWS_FEEDS)} news sources monitor ho rahi hain\n"
-        f"📊 {len(STOCKS)} NSE stocks track ho rahe hain\n"
+        f"📰 {len(NEWS_FEEDS)} news sources\n"
+        f"📊 {len(STOCKS)} NSE stocks\n"
         f"🔍 Scan: Har {SCAN_INTERVAL_MIN} min\n"
-        f"🤖 AI: Groq (Llama 3.3 70B) — FREE!\n"
+        f"🤖 AI: Groq (Llama 3.3 70B)\n"
         f"📂 Max Open Positions: {MAX_OPEN_POSITIONS}\n"
-        f"⚡ Sirf strong news pe trade hoga!\n"
         f"{angel_line}\n\n"
         "Pehla scan 30 sec mein! 🚀"
     )

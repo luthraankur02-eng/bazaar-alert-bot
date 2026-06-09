@@ -672,7 +672,12 @@ async def get_nse_price(symbol: str, client: httpx.AsyncClient):
     return None
 
 
-async def _nse_yfinance_fallback(symbols: list) -> dict:
+async def _nse_fallback(symbols: list) -> dict:
+    """
+    Fallback: sirf NSE website scraping.
+    yfinance HATAYA — galat prices deta tha (e.g. Studds ₹740 instead of ₹527).
+    Agar NSE se bhi nahi mila → price_data mein entry hi nahi aayegi → trade block hoga.
+    """
     result = {}
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         try:
@@ -685,35 +690,20 @@ async def _nse_yfinance_fallback(symbols: list) -> dict:
             data = await get_nse_price(sym, client)
             if data:
                 result[sym] = data
-            else:
-                try:
-                    import yfinance as yf
-                    t    = yf.Ticker(sym)
-                    hist = t.history(period="1d", interval="5m")
-                    if not hist.empty:
-                        curr = round(float(hist["Close"].iloc[-1]), 2)
-                        prev = round(float(hist["Close"].iloc[0]), 2)
-                        result[sym] = {
-                            "price":        curr,
-                            "change_pct":   round((curr - prev) / prev * 100, 2) if prev else 0,
-                            "volume_ratio": 1.0,
-                            "high":         round(float(hist["High"].max()), 2),
-                            "low":          round(float(hist["Low"].min()), 2),
-                            "source":       "yfinance",
-                        }
-                except:
-                    pass
+            # Agar NSE se bhi nahi mila — skip, no price = no trade
             await asyncio.sleep(0.15)
+    logger.info(f"NSE fallback: {len(result)}/{len(symbols)} prices fetched")
     return result
 
 
 async def get_price_data(symbols: list) -> dict:
-    result      = {}
-    angel_data  = await angel.get_bulk_market_data(symbols)
+    result     = {}
+    angel_data = await angel.get_bulk_market_data(symbols)
     result.update(angel_data)
     missed = [s for s in symbols if s not in result]
     if missed:
-        fallback_data = await _nse_yfinance_fallback(missed)
+        logger.info(f"Angel missed {len(missed)} stocks — NSE scraping fallback...")
+        fallback_data = await _nse_fallback(missed)
         result.update(fallback_data)
     return result
 
@@ -1071,6 +1061,8 @@ async def run_scan(silent: bool = False):
         for msg in msgs:
             await send_to_all(msg)
             await asyncio.sleep(1)
+        # 🤖 FULL AUTO — signal milte hi dono users ke liye trade
+        await auto_execute_trade(result, price_data)
     else:
         open_count = len(portfolio["positions"])
         await send_to_all(
@@ -1080,6 +1072,105 @@ async def run_scan(silent: bool = False):
             f"📂 Open positions: {open_count}/{MAX_OPEN_POSITIONS}\n"
             f"⏳ Agli scan {SCAN_INTERVAL_MIN} min mein\n"
             f"_Sirf strong news pe trade hoga — patience rakho!_ 💪"
+        )
+
+
+async def auto_execute_trade(signal: dict, price_data: dict):
+    """
+    🤖 FULL AUTO TRADE — dono users ke liye khud execute karta hai.
+    Same saare checks hain jo YES handler mein the — price verify, duplicate block, limit check.
+    """
+    sym = signal.get("symbol", "")
+
+    # Live price verify
+    live_check = await get_price_data([sym])
+    if sym not in live_check:
+        await send_to_all(
+            f"🤖 *AUTO TRADE BLOCKED*\n"
+            f"⚠️ *{signal['name']}* ka live price nahi mila!\n"
+            f"Angel One + NSE dono pe available nahi. 🛡️"
+        )
+        return
+
+    live_price = live_check[sym]["price"]
+    ai_price   = signal["entry"]
+    diff_pct   = abs(ai_price - live_price) / live_price * 100
+    if diff_pct > 8:
+        await send_to_all(
+            f"🤖 *AUTO TRADE BLOCKED — Price Mismatch!*\n"
+            f"AI price: ₹{ai_price:,.2f} | Live: ₹{live_price:,.2f}\n"
+            f"Diff: {diff_pct:.1f}% — galat price se bacha liya! 🛡️"
+        )
+        return
+
+    price = live_price
+    executed_for = []
+
+    for user_id in [uid for uid in [MY_CHAT_ID, COUSIN_CHAT_ID] if uid]:
+        # Checks
+        if not can_trade_user(user_id):
+            continue
+        trade_key = f"{sym}_{user_id}"
+        if trade_key in portfolio.get("user_trades", set()):
+            continue
+        open_syms = [p.get("symbol","") for p in portfolio["positions"].values()]
+        if open_syms.count(sym) >= 1:
+            continue
+
+        qty  = max(1, int(portfolio["available"] * 0.4 / price))
+        cost = round(qty * price, 2)
+        if cost > portfolio["available"]:
+            await _send_to_user(user_id,
+                f"⚠️ Auto trade skip — capital kam hai!\n"
+                f"Cost: ₹{cost:,.0f} | Balance: ₹{portfolio['available']:,.0f}"
+            )
+            continue
+
+        # Execute
+        portfolio["available"] -= cost
+        portfolio["positions"][f"{sym}_{user_id}"] = {
+            "name":      signal["name"],
+            "symbol":    sym,
+            "qty":       qty,
+            "entry":     price,
+            "sl":        signal["stop_loss"],
+            "target":    signal["target"],
+            "direction": signal["direction"],
+            "cost":      cost,
+            "user_id":   user_id,
+            "open_time": datetime.datetime.now().strftime("%d %b %Y, %I:%M %p"),
+            "open_date": datetime.datetime.now().isoformat(),
+        }
+        portfolio["user_trades"].add(trade_key)
+        increment_trade(user_id)
+        left = trades_left_user(user_id)
+        executed_for.append(user_id)
+
+        await _send_to_user(user_id,
+            f"🤖 *AUTO TRADE OPEN!*\n"
+            f"{'📈' if signal['direction']=='BUY' else '📉'} *{signal['name']}*\n"
+            f"{signal['direction']} {qty} shares @ ₹{price:,.2f}\n"
+            f"🛑 SL: ₹{signal['stop_loss']:,.2f} | 🎯 T: ₹{signal['target']:,.2f}\n"
+            f"💼 Balance: ₹{portfolio['available']:,.0f}\n"
+            f"🔢 Trades: {get_trades_today(user_id)}/{MAX_TRADES_PER_DAY}"
+            + (f" | {left} aur bache" if left > 0 else " | Aaj bas itne!")
+        )
+
+    if executed_for:
+        net_worth = portfolio["available"] + sum(p["cost"] for p in portfolio["positions"].values())
+        await send_to_all(
+            f"🤖 *BOT NE AUTO TRADE LIYA!*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"{'📈' if signal['direction']=='BUY' else '📉'} *{signal['name']}*\n"
+            f"{signal['direction']} @ ₹{price:,.2f}\n"
+            f"SL: ₹{signal['stop_loss']:,.2f} | T: ₹{signal['target']:,.2f}\n\n"
+            f"💼 Net Worth: ₹{net_worth:,.0f}\n"
+            f"📂 Open Positions: {len(portfolio['positions'])}"
+        )
+    else:
+        await send_to_all(
+            f"🤖 *Auto trade skip* — {signal['name']}\n"
+            f"_(Limit full / position already open / capital nahi)_"
         )
 
 
@@ -1443,7 +1534,34 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        price = signal["entry"]
+        # ✅ LIVE PRICE VERIFY — yfinance hataya, ab sirf Angel One / NSE
+        sym        = signal["symbol"]
+        live_check = await get_price_data([sym])
+        if sym not in live_check:
+            await update.message.reply_text(
+                f"⚠️ *{signal['name']}* ka live price nahi mila!\n"
+                f"Angel One + NSE dono pe available nahi — trade block kiya. 🛡️\n"
+                f"_(Stock watchlist mein add karna padega)_",
+                parse_mode="Markdown"
+            )
+            return
+
+        live_price = live_check[sym]["price"]
+        ai_price   = signal["entry"]
+        diff_pct   = abs(ai_price - live_price) / live_price * 100
+        if diff_pct > 8:
+            await update.message.reply_text(
+                f"⚠️ *Price mismatch detected!*\n"
+                f"AI signal price: ₹{ai_price:,.2f}\n"
+                f"Live price: ₹{live_price:,.2f}\n"
+                f"Difference: {diff_pct:.1f}% — Trade block kiya! 🛡️\n"
+                f"_(Galat price se bachaye — jaise Studds ₹740 bug)_",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Live price use karo — AI price nahi
+        price = live_price
         qty   = max(1, int(portfolio["available"] * 0.4 / price))
         cost  = round(qty * price, 2)
 
